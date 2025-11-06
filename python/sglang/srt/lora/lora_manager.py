@@ -524,17 +524,10 @@ class LoRAManager:
         self.fetch_new_loras({None})
 
     def set_lora_module(self, module_name, module):
+        """Wrap any module (standard or MoE) with LoRA support."""
         lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
-
-    def set_moe_lora_module(self, module_name, module):
-        """Wrap MoE module with LoRA support."""
-        from sglang.srt.layers.moe.lora_moe import FusedMoEWithLoRA
-
-        lora_moe = FusedMoEWithLoRA(module, self.lora_backend)
-        replace_submodule(self.base_model, module_name, lora_moe)
-        return lora_moe
 
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
