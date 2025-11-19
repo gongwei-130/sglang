@@ -1,5 +1,5 @@
 ARG CUDA_VERSION=12.9.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base-system
 
 ARG TARGETARCH
 ARG BUILD_TYPE=all
@@ -36,43 +36,115 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
 fi
 
-RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y && apt install software-properties-common -y \
- && add-apt-repository ppa:deadsnakes/ppa -y \
- && apt install python3.12-full python3.12-dev python3.10-venv -y \
- && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
- && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
- && update-alternatives --set python3 /usr/bin/python3.12 \
- && wget https://bootstrap.pypa.io/get-pip.py \
- && python3 get-pip.py \
- # Fix for `apt-add-repository`
- && cd /usr/lib/python3/dist-packages/ \
- && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
+RUN --mount=type=cache,target=/var/cache/apt set -eux; \
+    echo 'tzdata tzdata/Areas select America' | debconf-set-selections; \
+    echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections; \
+    apt update; \
+    apt install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        software-properties-common \
+        wget; \
+    add-apt-repository ppa:deadsnakes/ppa -y; \
+    apt update; \
+    apt install -y --no-install-recommends \
+        python3.12-full \
+        python3.12-dev \
+        python3.10-venv \
+        tzdata \
+        netcat-openbsd \
+        kmod \
+        unzip \
+        openssh-server \
+        lsof \
+        git \
+        build-essential \
+        cmake \
+        perl \
+        libopenmpi-dev \
+        libnuma1 \
+        libnuma-dev \
+        numactl \
+        libibverbs-dev \
+        libibverbs1 \
+        libibumad3 \
+        librdmacm1 \
+        libnl-3-200 \
+        libnl-route-3-200 \
+        libnl-route-3-dev \
+        libnl-3-dev \
+        ibverbs-providers \
+        infiniband-diags \
+        perftest \
+        libgoogle-glog-dev \
+        libgtest-dev \
+        libjsoncpp-dev \
+        libunwind-dev \
+        libboost-all-dev \
+        libssl-dev \
+        libgrpc-dev \
+        libgrpc++-dev \
+        libprotobuf-dev \
+        protobuf-compiler \
+        protobuf-compiler-grpc \
+        pybind11-dev \
+        libhiredis-dev \
+        libcurl4-openssl-dev \
+        libczmq4 \
+        libczmq-dev \
+        libfabric-dev \
+        patchelf \
+        nvidia-dkms-550 \
+        devscripts \
+        debhelper \
+        fakeroot \
+        dkms \
+        check \
+        libsubunit0 \
+        libsubunit-dev \
+        rdma-core; \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1; \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2; \
+    update-alternatives --set python3 /usr/bin/python3.12; \
+    wget https://bootstrap.pypa.io/get-pip.py; \
+    python3 get-pip.py; \
+    cd /usr/lib/python3/dist-packages/ && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so; \
+    ln -sf /usr/bin/python3.12 /usr/bin/python; \
+    rm -f get-pip.py; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get clean
 
-# Set timezone and install all packages
-RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
- && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
- && apt-get update && apt-get install -y --no-install-recommends \
-    tzdata \
-    software-properties-common netcat-openbsd kmod unzip openssh-server \
-    curl wget lsof zsh ccache tmux htop git-lfs tree \
-    build-essential cmake perl \
-    libopenmpi-dev libnuma1 libnuma-dev numactl \
-    libibverbs-dev libibverbs1 libibumad3 \
-    librdmacm1 libnl-3-200 libnl-route-3-200 libnl-route-3-dev libnl-3-dev \
-    ibverbs-providers infiniband-diags perftest \
-    libgoogle-glog-dev libgtest-dev libjsoncpp-dev libunwind-dev \
-    libboost-all-dev libssl-dev \
-    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
-    pybind11-dev \
-    libhiredis-dev libcurl4-openssl-dev \
-    libczmq4 libczmq-dev \
-    libfabric-dev \
-    patchelf \
-    nvidia-dkms-550 \
-    devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
- && ln -sf /usr/bin/python3.12 /usr/bin/python \
- && rm -rf /var/lib/apt/lists/* \
- && apt-get clean
+# Developer tooling (frequently updated) lives in its own layer to avoid rebuilding base deps.
+RUN --mount=type=cache,target=/var/cache/apt set -eux; \
+    apt update; \   
+    apt install -y --no-install-recommends \
+        gdb \
+        ninja-build \
+        vim \
+        tmux \
+        htop \
+        git-lfs \
+        zsh \
+        tree \
+        silversearcher-ag \
+        cloc \
+        pkg-config \
+        bear \
+        ccache \
+        less \
+        locales; \
+    echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ \"$(uname -m)\" = \"aarch64\" ]; then echo \"arm64\"; else echo \"amd64\"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list; \
+    apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ \"$(uname -m)\" = \"aarch64\" ]; then echo \"arm64\"; else echo \"x86_64\"; fi)/7fa2af80.pub; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends nsight-systems-cli; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get clean
+
+RUN locale-gen en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
 
 # Replace pip global cache if it is specified
 RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
@@ -91,10 +163,81 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 # Fix DeepEP IBGDA symlink
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
+# Python tools
+RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
+    datamodel_code_generator \
+    mooncake-transfer-engine==0.3.7.post2 \
+    pre-commit \
+    pytest \
+    black \
+    isort \
+    icdiff \
+    uv \
+    wheel \
+    scikit-build-core \
+    nixl \
+    py-spy
+
+# Install minimal Python packages
+RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --break-system-packages \
+    pandas \
+    matplotlib \
+    tabulate
+
+# Install diff-so-fancy
+RUN curl -LSso /usr/local/bin/diff-so-fancy https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
+    && chmod +x /usr/local/bin/diff-so-fancy
+
+# Install clang-format
+RUN curl -LSso /usr/local/bin/clang-format https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
+    && chmod +x /usr/local/bin/clang-format
+
+# Install clangd
+RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
+    && unzip clangd.zip \
+    && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
+    && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
+    && rm -rf clangd_18.1.3 clangd.zip
+
+# Install CMake
+RUN CMAKE_VERSION=3.31.1 \
+    && ARCH=$(uname -m) \
+    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
+    && wget -q "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
+    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
+    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
+    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
+
+
+# Add yank script
+COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
+
+# Install oh-my-zsh and plugins
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+    && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
+    && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+
+# Configure Vim and tmux
+COPY docker/configs/.vimrc /root/.vimrc
+COPY docker/configs/.tmux.conf /root/.tmux.conf
+
+# Configure Git
+COPY docker/configs/.gitconfig /tmp/.gitconfig
+RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
+
+# Configure zsh
+COPY docker/configs/.zshrc /root/.zshrc
+
+RUN set -euxo ; \
+    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
+    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
+    bash -s -- --tag 1.42.4 --to /usr/local/bin
+
 FROM scratch AS local_src
 COPY . /src
 
-FROM base AS build-image
+FROM base-system AS build-image
 # Install SGLang
 # Until torch 2.9 and cu13 are stable we manually update torch if you are on CUDA 13
 WORKDIR /sgl-workspace
@@ -218,98 +361,6 @@ RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]
     MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --break-system-packages -e .; \
 fi
 
-# Python tools
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
-    datamodel_code_generator \
-    mooncake-transfer-engine==0.3.7.post2 \
-    pre-commit \
-    pytest \
-    black \
-    isort \
-    icdiff \
-    uv \
-    wheel \
-    scikit-build-core \
-    nixl \
-    py-spy
-
-# Install development tools and utilities
-RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y \
-    gdb \
-    ninja-build \
-    vim \
-    tmux \
-    htop \
-    wget \
-    curl \
-    locales \
-    lsof \
-    git \
-    git-lfs \
-    zsh \
-    tree \
-    silversearcher-ag \
-    cloc \
-    unzip \
-    pkg-config \
-    libssl-dev \
-    bear \
-    ccache \
-    less \
-    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-RUN --mount=type=cache,target=/var/cache/apt apt update -y \
-    && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
-    && apt update -y \
-    && apt install nsight-systems-cli -y
-
-# Set up locale
-RUN locale-gen en_US.UTF-8
-ENV LANG=en_US.UTF-8
-ENV LANGUAGE=en_US:en
-ENV LC_ALL=en_US.UTF-8
-
-# Install minimal Python packages
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --break-system-packages \
-    pytest \
-    black \
-    isort \
-    icdiff \
-    scikit-build-core \
-    uv \
-    pre-commit \
-    pandas \
-    matplotlib \
-    tabulate
-
-# Install diff-so-fancy
-RUN curl -LSso /usr/local/bin/diff-so-fancy https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
-    && chmod +x /usr/local/bin/diff-so-fancy
-
-# Install clang-format
-RUN curl -LSso /usr/local/bin/clang-format https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
-    && chmod +x /usr/local/bin/clang-format
-
-# Install clangd
-RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
-    && unzip clangd.zip \
-    && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
-    && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
-    && rm -rf clangd_18.1.3 clangd.zip
-
-# Install CMake
-RUN CMAKE_VERSION=3.31.1 \
-    && ARCH=$(uname -m) \
-    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && wget -q "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
-    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
-    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
-    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
-    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Build and install sgl-router (Rust toolchain removed after build to save space)
 RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
@@ -323,29 +374,7 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
 
-# Add yank script
-COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
 
-# Install oh-my-zsh and plugins
-RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-    && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
-
-# Configure Vim and tmux
-COPY docker/configs/.vimrc /root/.vimrc
-COPY docker/configs/.tmux.conf /root/.tmux.conf
-
-# Configure Git
-COPY docker/configs/.gitconfig /tmp/.gitconfig
-RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
-
-# Configure zsh
-COPY docker/configs/.zshrc /root/.zshrc
-
-RUN set -euxo ; \
-    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /usr/local/bin
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
