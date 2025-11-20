@@ -103,22 +103,6 @@ RUN --mount=type=cache,target=/var/cache/apt set -eux; \
         check \
         libsubunit0 \
         libsubunit-dev \
-        rdma-core; \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1; \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2; \
-    update-alternatives --set python3 /usr/bin/python3.12; \
-    wget https://bootstrap.pypa.io/get-pip.py; \
-    python3 get-pip.py; \
-    cd /usr/lib/python3/dist-packages/ && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so; \
-    ln -sf /usr/bin/python3.12 /usr/bin/python; \
-    rm -f get-pip.py; \
-    rm -rf /var/lib/apt/lists/*; \
-    apt-get clean
-
-# Developer tooling (frequently updated) lives in its own layer to avoid rebuilding base deps.
-RUN --mount=type=cache,target=/var/cache/apt set -eux; \
-    apt update; \   
-    apt install -y --no-install-recommends \
         gdb \
         ninja-build \
         vim \
@@ -133,7 +117,20 @@ RUN --mount=type=cache,target=/var/cache/apt set -eux; \
         bear \
         ccache \
         less \
-        locales; \
+        locales \
+        rdma-core; \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1; \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2; \
+    update-alternatives --set python3 /usr/bin/python3.12; \
+    wget https://bootstrap.pypa.io/get-pip.py; \
+    python3 get-pip.py; \
+    cd /usr/lib/python3/dist-packages/ && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so; \
+    ln -sf /usr/bin/python3.12 /usr/bin/python; \
+    rm -f get-pip.py; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get clean
+
+RUN --mount=type=cache,target=/var/cache/apt set -eux; \
     echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ \"$(uname -m)\" = \"aarch64\" ]; then echo \"arm64\"; else echo \"amd64\"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list; \
     apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ \"$(uname -m)\" = \"aarch64\" ]; then echo \"arm64\"; else echo \"x86_64\"; fi)/7fa2af80.pub; \
     apt-get update; \
@@ -146,12 +143,40 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-# Replace pip global cache if it is specified
-RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
-    python3 -m pip config set global.index-url ${PIP_DEFAULT_INDEX}; \
-fi
+# Add yank script
+COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
 
-# GDRCopy installation
+# Install oh-my-zsh and plugins
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+    && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
+    && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+
+# Configure Vim and tmux
+COPY docker/configs/.vimrc /root/.vimrc
+COPY docker/configs/.tmux.conf /root/.tmux.conf
+
+# Configure Git
+COPY docker/configs/.gitconfig /tmp/.gitconfig
+RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
+
+# Configure zsh
+COPY docker/configs/.zshrc /root/.zshrc
+
+RUN set -euxo ; \
+    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
+    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
+    bash -s -- --tag 1.42.4 --to /usr/local/bin
+
+
+
+
+# Fix DeepEP IBGDA symlink
+RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
+
+FROM base-system AS tooling-deps
+
+# Developer tooling (frequently updated) lives in its own layer to avoid rebuilding base deps.
+    # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
  && wget -q https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
  && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
@@ -160,8 +185,12 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
  && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
  && cd / && rm -rf /tmp/gdrcopy
 
-# Fix DeepEP IBGDA symlink
-RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
+
+
+# Replace pip global cache if it is specified
+RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
+    python3 -m pip config set global.index-url ${PIP_DEFAULT_INDEX}; \
+fi
 
 # Python tools
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
@@ -208,85 +237,6 @@ RUN CMAKE_VERSION=3.31.1 \
     && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
-
-
-# Add yank script
-COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
-
-# Install oh-my-zsh and plugins
-RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-    && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
-
-# Configure Vim and tmux
-COPY docker/configs/.vimrc /root/.vimrc
-COPY docker/configs/.tmux.conf /root/.tmux.conf
-
-# Configure Git
-COPY docker/configs/.gitconfig /tmp/.gitconfig
-RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
-
-# Configure zsh
-COPY docker/configs/.zshrc /root/.zshrc
-
-RUN set -euxo ; \
-    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /usr/local/bin
-
-FROM scratch AS local_src
-COPY . /src
-
-FROM base-system AS build-image
-# Install SGLang
-# Until torch 2.9 and cu13 are stable we manually update torch if you are on CUDA 13
-WORKDIR /sgl-workspace
-ARG BRANCH_TYPE
-COPY --from=local_src /src /tmp/local_src
-RUN if [ "$BRANCH_TYPE" = "local" ]; then \
-        cp -r /tmp/local_src /sgl-workspace/sglang; \
-    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
-        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
-    else \
-        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
-    fi \
- && rm -rf /tmp/local_src
-RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
- && cd sglang \
- && case "$CUDA_VERSION" in \
-      12.6.1) CUINDEX=126 ;; \
-      12.8.1) CUINDEX=128 ;; \
-      12.9.1) CUINDEX=129 ;; \
-      13.0.1) CUINDEX=130 ;; \
-      *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
-    esac \
- && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-      python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
-   ; \
-   elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION} \
-   ; \
-   elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-      python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
-   ; \
-   else \
-      echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
-   ; \
-   fi \
- && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
- && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-      python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
-   fi \
- && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-      python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
-    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-      python3 -m pip uninstall -y torch torchaudio torchvision ; \
-      python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
-    else \
-      echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
-    fi \
- && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 # Download NVSHMEM source files
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
@@ -346,6 +296,62 @@ RUN --mount=type=cache,target=/root/.cache/pip cd /sgl-workspace/DeepEP && \
       sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
+
+
+FROM scratch AS local_src
+COPY . /src
+
+FROM tooling-deps AS build-image
+# Install SGLang
+# Until torch 2.9 and cu13 are stable we manually update torch if you are on CUDA 13
+WORKDIR /sgl-workspace
+ARG BRANCH_TYPE
+COPY --from=local_src /src /tmp/local_src
+RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+        cp -r /tmp/local_src /sgl-workspace/sglang; \
+    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
+        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    else \
+        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    fi \
+ && rm -rf /tmp/local_src
+RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+ && cd sglang \
+ && case "$CUDA_VERSION" in \
+      12.6.1) CUINDEX=126 ;; \
+      12.8.1) CUINDEX=128 ;; \
+      12.9.1) CUINDEX=129 ;; \
+      13.0.1) CUINDEX=130 ;; \
+      *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+    esac \
+ && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+      python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+   ; \
+   elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
+      python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION} \
+   ; \
+   elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
+      python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+   ; \
+   else \
+      echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+   ; \
+   fi \
+ && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
+      python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+   fi \
+ && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+      python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+      python3 -m pip uninstall -y torch torchaudio torchvision ; \
+      python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
+    else \
+      echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
+    fi \
+ && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+
 
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
