@@ -671,6 +671,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         lora_ranks = batch_info.lora_ranks  # [num_loras]
         scalings = batch_info.scalings  # [num_loras]
 
+        # For MoE LoRA, we need to handle scaling carefully due to the non-linear
+        # activation between gate_up and down projections. Apply scaling only at the
+        # final stage (down_proj) to avoid double-scaling through the activation.
+        # Create a tensor of 1.0 for the gate_up stage.
+        no_scaling = torch.ones_like(scalings)
+
         # Use precomputed per-token LoRA indices from forward batch
         lora_indices = self.lora_backend.forward_batch.token_lora_indices
 
@@ -710,7 +716,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             expert_ids=expert_ids,
             lora_ids=lora_ids,
             lora_ranks=lora_ranks,
-            lora_scalings=scalings,
+            lora_scalings=no_scaling,  # Don't apply scaling here; apply only at down_proj
             num_experts=num_experts,
             base_output=lora_intermediate_cache1,
             is_down_proj=False,
