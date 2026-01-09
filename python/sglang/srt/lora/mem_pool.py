@@ -18,7 +18,15 @@ from sglang.srt.lora.utils import (
     get_stacked_multiply,
     get_target_module_name,
 )
+
+
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+
+def _is_row_parallel_module(module_name: str) -> bool:
+    """Check if module uses row parallelism, handling _moe suffix."""
+    base_name = module_name.replace("_moe", "")
+    return base_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +145,7 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+        if self.tp_size > 1 and _is_row_parallel_module(module_name):
             input_dim = divide(input_dim, self.tp_size)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
@@ -159,7 +167,7 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+        if self.tp_size > 1 and _is_row_parallel_module(module_name):
             input_dim = divide(input_dim, self.tp_size)
 
         # Check if MoE module and return appropriate shape (the assumption is that down_proj and gate_up_proj are only used in MoE modules)
@@ -217,7 +225,7 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+        if self.tp_size > 1 and not _is_row_parallel_module(module_name):
             output_dim = divide(output_dim, self.tp_size)
 
         # Check if MoE module and return appropriate shape

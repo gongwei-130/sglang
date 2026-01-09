@@ -303,11 +303,16 @@ class LoRAManager:
             token_lora_indices = token_lora_indices_reordered
         else:
             # Tokens are reordered (chunked backend): need to convert back to original order
-            inverse_permutation = torch.empty_like(batch_info.permutation)
-            inverse_permutation[batch_info.permutation] = torch.arange(
+            # Use only the valid portion of the permutation tensor (important for CUDA graph mode
+            # where the tensor is pre-allocated for the maximum batch size)
+            permutation = batch_info.permutation[:num_tokens]
+            inverse_permutation = torch.empty(
+                num_tokens, dtype=permutation.dtype, device=permutation.device
+            )
+            inverse_permutation[permutation] = torch.arange(
                 num_tokens,
-                dtype=batch_info.permutation.dtype,
-                device=batch_info.permutation.device,
+                dtype=permutation.dtype,
+                device=permutation.device,
             )
             token_lora_indices = token_lora_indices_reordered[inverse_permutation]
 
