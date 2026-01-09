@@ -39,6 +39,10 @@ def moe_dispatch(
     num_tokens, top_k = topk_ids.shape
     device = topk_ids.device
 
+    # Ensure lora_indices is on the same device as topk_ids
+    if lora_indices.device != device:
+        lora_indices = lora_indices.to(device)
+
     # Flatten topk dimensions: [num_tokens * top_k]
     flat_topk_ids = topk_ids.flatten()
     flat_topk_weights = topk_weights.flatten()

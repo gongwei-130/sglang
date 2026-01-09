@@ -227,7 +227,11 @@ class LoRAMemoryPool:
                 "num_local_experts",
                 getattr(self.base_hf_config, "num_experts", 0),
             )
-            return (self.max_loras_per_batch, num_experts, output_dim, max_lora_dim)
+            # Use max_lora_dim * 2 to match lora_A shape for stacked modules (gate_up_proj)
+            # The kernel uses effective_rank = rank * 2 for gate_up_proj, so both A and B
+            # need the same max rank dimension
+            max_rank_dim = max_lora_dim * 2
+            return (self.max_loras_per_batch, num_experts, output_dim, max_rank_dim)
         else:
             return (self.max_loras_per_batch, output_dim, max_lora_dim)
 
@@ -268,33 +272,49 @@ class LoRAMemoryPool:
             for module_name in target_modules:
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
-                if module_name in ambiguous_modules and has_shared_experts and has_moe:
-                    # Allocate separate buffers for shared and MoE contexts
-                    # Shared expert version (3D)
-                    shared_key = module_name
-                    buffer[shared_key] = [
-                        torch.empty(
-                            get_lora_shape_fn(
-                                module_name, base_model, self.max_lora_rank, idx
-                            ),
-                            dtype=self.dtype,
-                            device=device,
-                        )
-                        for idx in range(self.num_layer)
-                    ]
+                if module_name in ambiguous_modules and has_moe:
+                    if has_shared_experts:
+                        # Model has both shared experts and MoE experts
+                        # Allocate separate buffers for shared and MoE contexts
+                        # Shared expert version (3D)
+                        shared_key = module_name
+                        buffer[shared_key] = [
+                            torch.empty(
+                                get_lora_shape_fn(
+                                    module_name, base_model, self.max_lora_rank, idx
+                                ),
+                                dtype=self.dtype,
+                                device=device,
+                            )
+                            for idx in range(self.num_layer)
+                        ]
 
-                    # MoE expert version (4D)
-                    moe_key = f"{module_name}_moe"
-                    buffer[moe_key] = [
-                        torch.empty(
-                            get_lora_shape_fn(
-                                moe_key, base_model, self.max_lora_rank, idx
-                            ),
-                            dtype=self.dtype,
-                            device=device,
-                        )
-                        for idx in range(self.num_layer)
-                    ]
+                        # MoE expert version (4D)
+                        moe_key = f"{module_name}_moe"
+                        buffer[moe_key] = [
+                            torch.empty(
+                                get_lora_shape_fn(
+                                    moe_key, base_model, self.max_lora_rank, idx
+                                ),
+                                dtype=self.dtype,
+                                device=device,
+                            )
+                            for idx in range(self.num_layer)
+                        ]
+                    else:
+                        # Model has only MoE experts (no shared experts)
+                        # Allocate only MoE (4D) buffer with _moe key
+                        moe_key = f"{module_name}_moe"
+                        buffer[moe_key] = [
+                            torch.empty(
+                                get_lora_shape_fn(
+                                    moe_key, base_model, self.max_lora_rank, idx
+                                ),
+                                dtype=self.dtype,
+                                device=device,
+                            )
+                            for idx in range(self.num_layer)
+                        ]
                 else:
                     # Standard allocation for unambiguous modules
                     buffer[module_name] = [
