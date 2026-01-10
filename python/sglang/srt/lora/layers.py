@@ -798,13 +798,63 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
-        # For MoE layers, tensor parallelism is typically not used
-        # Return weights unchanged
+        """
+        Slice LoRA A weights for tensor parallelism.
+
+        For MoE layers:
+        - gate_up_proj (column-parallel): A has shape [rank, hidden_size] - NO slicing
+        - down_proj (row-parallel): A has shape [rank, intermediate_size] - SLICE along dim 1
+
+        We detect by checking if A.shape[1] equals the full intermediate_size.
+        """
+        tp_size = self.base_layer.moe_tp_size
+        if tp_size <= 1:
+            return A
+
+        intermediate_size_per_partition = self.base_layer.intermediate_size_per_partition
+        full_intermediate_size = intermediate_size_per_partition * tp_size
+
+        # If A's input dimension matches full intermediate_size, it's down_proj - slice it
+        # gate_up_proj A has hidden_size which is different from intermediate_size
+        if A.shape[1] == full_intermediate_size:
+            start_idx = tp_rank * intermediate_size_per_partition
+            end_idx = (tp_rank + 1) * intermediate_size_per_partition
+            A = A[:, start_idx:end_idx].contiguous()
+
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # For MoE layers, tensor parallelism is typically not used
-        # Return weights unchanged
+        """
+        Slice LoRA B weights for tensor parallelism.
+
+        For MoE layers:
+        - gate_up_proj (column-parallel): B has shape [2*intermediate_size, rank] - SLICE along dim 0
+        - down_proj (row-parallel): B has shape [hidden_size, rank] - NO slicing
+
+        We detect by checking if B.shape[0] equals 2*full_intermediate_size.
+        """
+        tp_size = self.base_layer.moe_tp_size
+        if tp_size <= 1:
+            return B
+
+        intermediate_size_per_partition = self.base_layer.intermediate_size_per_partition
+        full_intermediate_size = intermediate_size_per_partition * tp_size
+        full_gate_up_size = 2 * full_intermediate_size
+
+        # If B's output dimension matches full gate_up_size, it's gate_up_proj - slice it
+        # down_proj B has hidden_size which is different from 2*intermediate_size
+        if B.shape[0] == full_gate_up_size:
+            # gate_up is [gate, up] concatenated, need to slice both halves
+            shard_size = intermediate_size_per_partition
+
+            start_idx = tp_rank * shard_size
+            end_idx = (tp_rank + 1) * shard_size
+
+            # Slice gate and up portions separately and concatenate
+            B_gate = B[start_idx:end_idx, :]
+            B_up = B[full_intermediate_size + start_idx : full_intermediate_size + end_idx, :]
+            B = torch.cat([B_gate, B_up], dim=0).contiguous()
+
         return B
 
 

@@ -446,7 +446,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
         disable_cuda_graph: bool = DISABLE_CUDA_GRAPH,
         lora_target_modules: Optional[List[str]] = LORA_TARGET_MODULES,
-        tp_size: int = 1,
+        tp_size: int = 4,
     ):
         """
         Run comparison test between SGLang and HuggingFace with LoRA.
