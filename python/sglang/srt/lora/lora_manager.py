@@ -287,10 +287,19 @@ class LoRAManager:
         batch_info = self.lora_backend.batch_info
         num_tokens = forward_batch.input_ids.shape[0]  # Tokens in current forward pass
 
-        # Create tensor and fill with adapter indices from segments
-        token_lora_indices_reordered = torch.empty(
-            num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device
-        )
+        # For CUDA graph mode, use pre-allocated tensor and update in-place
+        # This is critical for MoE LoRA which accesses token_lora_indices directly
+        if use_cuda_graph and hasattr(self.lora_backend, "cuda_graph_token_lora_indices"):
+            # Use pre-allocated tensor, slice to current num_tokens
+            token_lora_indices_reordered = (
+                self.lora_backend.cuda_graph_token_lora_indices[:num_tokens]
+            )
+        else:
+            # Create new tensor for non-CUDA-graph mode
+            token_lora_indices_reordered = torch.empty(
+                num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device
+            )
+
         seg_indptr = batch_info.seg_indptr  # [num_segments + 1]
         for seg_idx in range(batch_info.num_segments):
             start_token = seg_indptr[seg_idx]
@@ -328,9 +337,12 @@ class LoRAManager:
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
                 # Hack for FusedMoE layer
-                if isinstance(module, FusedMoEWithLoRA) and all(
-                    x in self.target_modules for x in ["gate_up_proj", "down_proj"]
-                ):
+                # Check for either fused (gate_up_proj) or unfused (gate_proj, up_proj) variants
+                has_gate_up = "gate_up_proj" in self.target_modules or (
+                    "gate_proj" in self.target_modules and "up_proj" in self.target_modules
+                )
+                has_down = "down_proj" in self.target_modules
+                if isinstance(module, FusedMoEWithLoRA) and has_gate_up and has_down:
                     gate_up_a = self.memory_pool.get_tensor(
                         target_module="gate_up_proj_moe",
                         layer_id=layer_id,
@@ -587,9 +599,15 @@ class LoRAManager:
                 continue
 
             # Temporarily workaround for FusedMoE layer
-            if isinstance(module, FusedMoE) and all(
+            # Handle both fused (gate_up_proj) and unfused (gate_proj, up_proj) variants
+            has_fused_moe_lora = all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
-            ):
+            )
+            has_unfused_moe_lora = all(
+                x in self.target_modules for x in ["gate_proj", "up_proj", "down_proj"]
+            )
+            if isinstance(module, FusedMoE) and (has_fused_moe_lora or has_unfused_moe_lora):
+                layer_id = get_layer_id(module_name)
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )

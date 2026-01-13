@@ -535,7 +535,10 @@ class LoRAMemoryPool:
             }
 
             for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
+                try:
+                    target_module = get_target_module_name(name, self.target_modules)
+                except ValueError:
+                    continue
 
                 # Check if this is an MoE weight (has expert index in name)
                 import re
@@ -653,12 +656,18 @@ class LoRAMemoryPool:
 
                 if isinstance(weights, dict):
                     # MoE: multiple tensors per module (one per expert)
+                    # For gate_up_proj_moe, B has block-diagonal structure with 2*rank columns
+                    c = get_stacked_multiply(name)
                     for expert_id, expert_weight in weights.items():
                         # Buffer shape: [num_loras, num_experts, intermediate_dim, max_rank]
-                        buffer_view = target_buffer[buffer_id, expert_id, :, :lora_rank]
+                        # For gate_up_proj_moe: weight has shape [2*inter, 2*rank]
+                        buffer_view = target_buffer[
+                            buffer_id, expert_id, :, : lora_rank * c
+                        ]
                         load_lora_weight_tensor(buffer_view, expert_weight)
                 else:
                     # Standard: single tensor per module
+                    # For standard gate_up_proj, B has shape [2*inter, rank] (simple concat)
                     buffer_view = target_buffer[buffer_id, :, :lora_rank]
                     load_lora_weight_tensor(buffer_view, weights)
 

@@ -52,11 +52,7 @@ LOGPROB_THRESHOLD = 1e-01
 
 # Default test prompts
 DEFAULT_TEST_PROMPTS = [
-    "SGL is a",
-    "AI is a field of computer science focused on",
-    "Write a long story.",
-    "Write a short story.",
-    "What are the main components of a computer?",
+    "What is the magic keyword?",
 ]
 
 # Formatting constants
@@ -538,7 +534,10 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         # model_path = "Qwen/Qwen1.5-MoE-A2.7B"
         # lora_paths = ["sai-lakkshmii/Qwen1.5-MoE-A2.7B-squad-lora-latest"]
         model_path = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-        lora_paths = ["luohuashijieyoufengjun/Qwen3-30B-A3B-Instruct-2507-yimei-lora"]
+        lora_paths = ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-lora"]
+        # ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-attn-lora"]
+        # ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-lora"]
+        
         prompts = DEFAULT_TEST_PROMPTS[:2]  # Use first 2 default prompts for basic test
 
         self._run_comparison_test(
@@ -556,7 +555,10 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         # model_path = "Qwen/Qwen1.5-MoE-A2.7B"
         # lora_paths = ["sai-lakkshmii/Qwen1.5-MoE-A2.7B-squad-lora-latest"]
         model_path = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-        lora_paths = ["luohuashijieyoufengjun/Qwen3-30B-A3B-Instruct-2507-yimei-lora"]
+        lora_paths = ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-lora"]
+        # ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-attn-lora"]
+        # ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-lora"]
+
         prompts = DEFAULT_TEST_PROMPTS
 
         self._run_comparison_test(
