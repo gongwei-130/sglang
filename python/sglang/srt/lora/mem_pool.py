@@ -559,6 +559,17 @@ class LoRAMemoryPool:
                         temp_B_buffer[target_module][expert_id] = weights
                 else:
                     # Standard weight - single tensor per module
+                    # For MoE-only models (no shared experts), some target modules only have
+                    # _moe keys in the buffer. Check if target_module exists; if not, check
+                    # if _moe version exists (which would indicate a mismatch).
+                    if target_module not in temp_A_buffer:
+                        moe_key = f"{target_module}_moe"
+                        if moe_key in temp_A_buffer:
+                            logger.warning(
+                                f"Skipping weight {name}: model expects MoE format for "
+                                f"{target_module} but adapter has non-MoE weight."
+                            )
+                        continue
                     if "lora_A" in name:
                         temp_A_buffer[target_module] = weights
                     else:
