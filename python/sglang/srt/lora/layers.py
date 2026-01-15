@@ -496,7 +496,12 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
-        q_size, k_size, _ = base_layer.output_sizes
+        # Use total sizes for indexing into the LoRA B tensor (which has total dims)
+        # output_sizes is buggy for GQA when tp_size >= num_kv_heads
+        head_size = base_layer.head_size
+        q_size = base_layer.total_num_heads * head_size
+        k_size = base_layer.total_num_kv_heads * head_size
+
         B_q_shard = B[q_start_idx:q_end_idx, :]
         B_k_shard = B[q_size + kv_start_idx : q_size + kv_end_idx, :]
         B_v_shard = B[q_size + k_size + kv_start_idx : q_size + k_size + kv_end_idx, :]
