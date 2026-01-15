@@ -226,7 +226,26 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         if self.tp_size > 1 and not _is_row_parallel_module(module_name):
-            output_dim = divide(output_dim, self.tp_size)
+            if module_name == "qkv_proj":
+                # GQA-aware sharding: KV heads may be replicated across TP ranks
+                head_dim = getattr(
+                    self.base_hf_config,
+                    "head_dim",
+                    self.base_hf_config.hidden_size
+                    // self.base_hf_config.num_attention_heads,
+                )
+                num_q_heads = self.base_hf_config.num_attention_heads
+                num_kv_heads = getattr(
+                    self.base_hf_config, "num_key_value_heads", num_q_heads
+                )
+                q_dim = divide(num_q_heads, self.tp_size) * head_dim
+                if self.tp_size >= num_kv_heads:
+                    kv_dim = head_dim  # 1 KV head per rank when TP >= num_kv_heads
+                else:
+                    kv_dim = divide(num_kv_heads, self.tp_size) * head_dim
+                output_dim = q_dim + 2 * kv_dim
+            else:
+                output_dim = divide(output_dim, self.tp_size)
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
