@@ -614,6 +614,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     6. Combine expert outputs
     """
 
+    USE_MERGE_WEIGHTS_PATH = True
+
     def __init__(
         self,
         base_layer: nn.Module,
@@ -644,15 +646,38 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
         Forward pass with LoRA injection BEFORE activation.
 
-        This is critical for MoE LoRA correctness because:
+        This supports two paths:
+        1. Merge weights path: When all tokens use the same LoRA adapter,
+           merge LoRA weights into base weights and run base forward.
+           This is faster than the per-expert kernel path.
+        2. Per-expert kernel path: When multiple adapters are in the batch,
+           use the Triton kernel for per-expert LoRA computation.
+
+        The merge path is critical for correctness because:
         - silu(base + lora) != silu(base) + silu(lora)
-        - We must add LoRA delta to intermediate_cache1 before activation
+        - We must add LoRA delta before activation
         """
         if not self.set_lora or self.gate_up_lora_a_weights is None:
             # No LoRA, use base layer directly
             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
-        # With LoRA enabled, use injection-based forward
+        # Check if we can use the faster merge weights path
+        # This requires all tokens to use the same LoRA adapter
+        forward_batch = self.lora_backend.forward_batch
+        lora_indices = forward_batch.token_lora_indices
+        forward_mode = forward_batch.forward_mode
+
+        if self.USE_MERGE_WEIGHTS_PATH and forward_mode.is_prefill():
+            unique_adapters = lora_indices.unique()
+            # Filter out -1 (tokens without LoRA)
+            unique_adapters = unique_adapters[unique_adapters >= 0]
+            if len(unique_adapters) == 1:
+                # Single adapter, merge path enabled, and prefill - use merge weights path
+                lora_id = unique_adapters[0].item()
+                return self._forward_with_merged_weights(
+                    hidden_states, topk_output, lora_id, **kwargs
+                )
+        # Multiple adapters, mixed batch, merge path disabled, or decode - use injection path
         return self._forward_with_lora_injection(hidden_states, topk_output, **kwargs)
 
     def _forward_with_lora_injection(
@@ -929,6 +954,207 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 flat_indices,
                 weighted_lora_down.to(intermediate_cache3_flat.dtype),
             )
+
+        # ===== Stage 6: Combine expert outputs =====
+        if top_k == 1:
+            # Already written to out_hidden_states
+            pass
+        elif top_k == 2:
+            torch.add(
+                intermediate_cache3[:, 0],
+                intermediate_cache3[:, 1],
+                out=out_hidden_states,
+            ).squeeze(dim=1)
+        else:
+            if _is_cuda:
+                if num_tokens <= 32:
+                    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                        moe_sum_reduce_torch_compile,
+                    )
+                    moe_sum_reduce_torch_compile(
+                        intermediate_cache3,
+                        out_hidden_states,
+                        1.0,  # routed_scaling_factor
+                    )
+                else:
+                    moe_sum_reduce_triton(
+                        intermediate_cache3,
+                        out_hidden_states,
+                        1.0,  # routed_scaling_factor
+                    )
+            else:
+                moe_sum_reduce_triton(
+                    intermediate_cache3,
+                    out_hidden_states,
+                    1.0,
+                )
+
+        # Handle reduce_results if needed
+        if base_layer.reduce_results and (base_layer.moe_tp_size > 1 or base_layer.moe_ep_size > 1):
+            from sglang.srt.distributed import tensor_model_parallel_all_reduce
+            out_hidden_states = tensor_model_parallel_all_reduce(out_hidden_states)
+
+        return out_hidden_states
+
+    def _forward_with_merged_weights(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        lora_id: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Forward pass that replicates the base layer MoE computation.
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            get_config_dtype_str,
+            invoke_fused_moe_kernel,
+            moe_align_block_size,
+            moe_sum_reduce_triton,
+            try_get_optimal_moe_config,
+        )
+
+        import triton.language as tl
+        import functools
+        import einops
+
+        # Get base layer attributes
+        base_layer = self.base_layer
+        w13 = base_layer.w13_weight
+        w2 = base_layer.w2_weight
+
+        # Get topk info
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+
+        # Setup computation parameters
+        num_tokens, hidden_size = hidden_states.shape
+        E, N, _ = w13.shape
+        top_k = topk_ids.shape[1]
+        # num_experts = base_layer.num_experts
+
+        compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+
+        # Get optimal config
+        config_dtype = get_config_dtype_str(
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            dtype=hidden_states.dtype,
+        )
+
+        get_config_func = functools.partial(
+            try_get_optimal_moe_config,
+            w13.shape,
+            (w2.shape[0], w2.shape[1], w2.shape[2]),
+            top_k,
+            config_dtype,
+            block_shape=None,
+            per_channel_quant=False,
+            return_down_config=True,
+        )
+
+        config, (down_config, _) = get_config_func(num_tokens)
+
+        # Align block size for efficient kernel execution
+        sorted_token_ids, expert_ids_aligned, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, config["BLOCK_SIZE_M"], E
+        )
+
+        # Allocate intermediate caches
+        # Use flat 2D shape like the base implementation for kernel compatibility
+        total_tokens = num_tokens * top_k
+        intermediate_cache1 = torch.empty(
+            (total_tokens, N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+        # ===== Stage 1: Gate-up GEMM (base) =====
+        invoke_fused_moe_kernel(
+            hidden_states,
+            w13 + einops.einsum(self.gate_up_lora_a_weights[lora_id], self.gate_up_lora_b_weights[lora_id], "b r i, b o r -> b o i"),
+            None,  # bias
+            intermediate_cache1,
+            None,  # a_scale
+            None,  # w_scale
+            None,  # w_zp
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids_aligned,
+            num_tokens_post_padded,
+            False,  # apply_router_weight_on_input
+            top_k,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+            block_shape=None,
+        )
+
+        # ===== Stage 3: Apply activation (to base + lora) =====
+        intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+        activation = base_layer.moe_runner_config.activation
+        if activation == "silu":
+            if _is_cuda:
+                silu_and_mul(intermediate_cache1, intermediate_cache2)
+            elif _is_hip:
+                vllm_ops.silu_and_mul(intermediate_cache2, intermediate_cache1)
+            else:
+                raise ValueError(f"Unsupported platform for activation: {activation}")
+        elif activation == "gelu":
+            if _is_cuda:
+                gelu_and_mul(intermediate_cache1, intermediate_cache2)
+            elif _is_hip:
+                vllm_ops.gelu_and_mul(intermediate_cache2, intermediate_cache1)
+            else:
+                raise ValueError(f"Unsupported platform for activation: {activation}")
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+        # ===== Stage 4: Down GEMM (base) =====
+        intermediate_cache3 = torch.empty(
+            (num_tokens, top_k, w2.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+        out_hidden_states = torch.empty_like(hidden_states)
+
+        invoke_fused_moe_kernel(
+            intermediate_cache2,
+            w2 + einops.einsum(self.down_lora_a_weights[lora_id], self.down_lora_b_weights[lora_id], "b r i, b o r -> b o i"),
+            None,  # bias
+            intermediate_cache3 if top_k != 1 else out_hidden_states.unsqueeze(0),
+            None,  # a_scale
+            None,  # w_scale
+            None,  # w_zp
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids_aligned,
+            num_tokens_post_padded,
+            True,  # apply_router_weight (on output for down proj)
+            1,
+            down_config or config,  # Use down_config if available
+            compute_type=compute_type,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+            block_shape=None,
+        )
 
         # ===== Stage 6: Combine expert outputs =====
         if top_k == 1:
