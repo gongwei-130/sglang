@@ -669,9 +669,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         if self.USE_MERGE_WEIGHTS_PATH and forward_mode.is_prefill():
             unique_adapters = lora_indices.unique()
-            # Filter out -1 (tokens without LoRA)
-            unique_adapters = unique_adapters[unique_adapters >= 0]
-            if len(unique_adapters) == 1:
+            if len(unique_adapters) == 1 and unique_adapters[0].item() >= 0:
+                # Single LoRA adapter, merge path enabled, and prefill - use merge weights path
                 # Single adapter, merge path enabled, and prefill - use merge weights path
                 lora_id = unique_adapters[0].item()
                 return self._forward_with_merged_weights(
