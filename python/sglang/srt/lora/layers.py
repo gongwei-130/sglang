@@ -1033,6 +1033,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         top_k = topk_ids.shape[1]
         # num_experts = base_layer.num_experts
 
+        scaling_factor = self.lora_backend.batch_info.scalings[lora_id]
         compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
         # Get optimal config
@@ -1074,7 +1075,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # ===== Stage 1: Gate-up GEMM (base) =====
         invoke_fused_moe_kernel(
             hidden_states,
-            w13 + einops.einsum(self.gate_up_lora_a_weights[lora_id], self.gate_up_lora_b_weights[lora_id], "b r i, b o r -> b o i"),
+            w13 + einops.einsum(
+                scaling_factor * self.gate_up_lora_a_weights[lora_id],
+                self.gate_up_lora_b_weights[lora_id],
+                "b r i, b o r -> b o i",
+            ),
             None,  # bias
             intermediate_cache1,
             None,  # a_scale
@@ -1133,7 +1138,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
-            w2 + einops.einsum(self.down_lora_a_weights[lora_id], self.down_lora_b_weights[lora_id], "b r i, b o r -> b o i"),
+            w2 + einops.einsum(
+                scaling_factor * self.down_lora_a_weights[lora_id],
+                self.down_lora_b_weights[lora_id],
+                "b r i, b o r -> b o i",
+            ),
             None,  # bias
             intermediate_cache3 if top_k != 1 else out_hidden_states.unsqueeze(0),
             None,  # a_scale
