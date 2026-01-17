@@ -23,8 +23,8 @@ import triton.language as tl
 def _per_expert_lora_kernel(
     # Input/Output pointers
     hidden_states_ptr,  # [num_total_tokens, input_dim]
-    lora_a_weights_ptr,  # [num_loras, num_experts, max_rank, input_dim]
-    lora_b_weights_ptr,  # [num_loras, num_experts, output_dim, max_rank]
+    lora_a_weights_ptr,  # [num_loras, num_experts, max_rank, input_dim] or [num_loras, max_rank, input_dim] if shared
+    lora_b_weights_ptr,  # [num_loras, num_experts, output_dim, max_rank] or [num_loras, output_dim, max_rank] if shared
     output_ptr,  # [num_total_tokens, output_dim] - base output (modified in-place)
     lora_output_ptr,  # [num_total_tokens, output_dim] - separate LoRA-only output
     # Dispatch info (length = num_dispatched)
@@ -37,14 +37,18 @@ def _per_expert_lora_kernel(
     max_rank: tl.constexpr,
     num_experts: tl.constexpr,
     num_dispatched,
-    # Strides for 4D LoRA A weights [num_loras, num_experts, max_rank, input_dim]
+    # Strides for LoRA A weights
+    # For 4D [num_loras, num_experts, max_rank, input_dim]: all strides used
+    # For 3D shared [num_loras, max_rank, input_dim]: expert stride is 0
     lora_a_stride_lora: tl.constexpr,
-    lora_a_stride_expert: tl.constexpr,
+    lora_a_stride_expert: tl.constexpr,  # 0 if shared (no expert dimension)
     lora_a_stride_rank: tl.constexpr,
     lora_a_stride_input: tl.constexpr,
-    # Strides for 4D LoRA B weights [num_loras, num_experts, output_dim, max_rank]
+    # Strides for LoRA B weights
+    # For 4D [num_loras, num_experts, output_dim, max_rank]: all strides used
+    # For 3D shared [num_loras, output_dim, max_rank]: expert stride is 0
     lora_b_stride_lora: tl.constexpr,
-    lora_b_stride_expert: tl.constexpr,
+    lora_b_stride_expert: tl.constexpr,  # 0 if shared (no expert dimension)
     lora_b_stride_output: tl.constexpr,
     lora_b_stride_rank: tl.constexpr,
     # LoRA ranks per adapter [num_loras]
@@ -55,6 +59,9 @@ def _per_expert_lora_kernel(
     BLOCK_SIZE: tl.constexpr,
     # Whether this is down_proj (affects stacking factor for rank calculation)
     IS_DOWN_PROJ: tl.constexpr,
+    # Hybrid mode flags: when True, the corresponding weight is shared (no expert dim)
+    USE_SHARED_A: tl.constexpr,
+    USE_SHARED_B: tl.constexpr,
 ):
     """
     Compute per-expert LoRA delta:
@@ -104,19 +111,31 @@ def _per_expert_lora_kernel(
     # hidden_states[actual_token_id, :]
     hidden_ptr = hidden_states_ptr + actual_token_id * input_dim
 
-    # A[lora_id_grid, expert_id, :, :]
-    lora_a_base = (
-        lora_a_weights_ptr
-        + lora_id_grid * lora_a_stride_lora
-        + expert_id * lora_a_stride_expert
-    )
+    # A[lora_id_grid, expert_id, :, :] for per-expert
+    # A[lora_id_grid, :, :] for shared (no expert dimension)
+    if USE_SHARED_A:
+        # Shared A: index by [lora_id, :, :] - broadcast to all experts
+        lora_a_base = lora_a_weights_ptr + lora_id_grid * lora_a_stride_lora
+    else:
+        # Per-expert A: index by [lora_id, expert_id, :, :]
+        lora_a_base = (
+            lora_a_weights_ptr
+            + lora_id_grid * lora_a_stride_lora
+            + expert_id * lora_a_stride_expert
+        )
 
-    # B[lora_id_grid, expert_id, :, :]
-    lora_b_base = (
-        lora_b_weights_ptr
-        + lora_id_grid * lora_b_stride_lora
-        + expert_id * lora_b_stride_expert
-    )
+    # B[lora_id_grid, expert_id, :, :] for per-expert
+    # B[lora_id_grid, :, :] for shared (no expert dimension)
+    if USE_SHARED_B:
+        # Shared B: index by [lora_id, :, :] - broadcast to all experts
+        lora_b_base = lora_b_weights_ptr + lora_id_grid * lora_b_stride_lora
+    else:
+        # Per-expert B: index by [lora_id, expert_id, :, :]
+        lora_b_base = (
+            lora_b_weights_ptr
+            + lora_id_grid * lora_b_stride_lora
+            + expert_id * lora_b_stride_expert
+        )
 
     # ----------------------------
     # Stage 1: intermediate = A @ hidden
@@ -222,6 +241,8 @@ def per_expert_lora_forward(
     num_experts: int,
     base_output: torch.Tensor = None,
     is_down_proj: bool = False,
+    shared_lora_a: torch.Tensor = None,
+    shared_lora_b: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Forward pass for per-expert LoRA computation using a 3D Triton grid:
@@ -230,11 +251,15 @@ def per_expert_lora_forward(
     Mathematically correct implementation that keeps expert outputs separate
     until final reduction, matching the base Triton MoE pattern.
 
+    Supports hybrid MoE LoRA where A or B weights can be shared across experts.
+
     Args:
         hidden_states: [num_tokens, input_dim] where input_dim is hidden_dim for gate_up_proj
                       or intermediate_dim for down_proj
-        lora_a_weights: [num_loras, num_experts, max_rank, input_dim]
-        lora_b_weights: [num_loras, num_experts, output_dim, max_rank]
+        lora_a_weights: [num_loras, num_experts, max_rank, input_dim] - per-expert A weights
+                       (ignored if shared_lora_a is provided)
+        lora_b_weights: [num_loras, num_experts, output_dim, max_rank] - per-expert B weights
+                       (ignored if shared_lora_b is provided)
         token_ids: [num_dispatched] - Original token indices
         expert_ids: [num_dispatched] - Expert ID for each dispatched token
         lora_ids: [num_dispatched] - LoRA ID for each dispatched token
@@ -245,6 +270,10 @@ def per_expert_lora_forward(
                     Each row contains the output for one (token, expert) pair
         is_down_proj: Whether this is for down_proj (intermediate_dim -> hidden_dim)
                      or gate_up_proj (hidden_dim -> intermediate_dim)
+        shared_lora_a: [num_loras, max_rank, input_dim] - shared A weights (optional)
+                      For hybrid gate_up: A is shared across all experts
+        shared_lora_b: [num_loras, output_dim, max_rank] - shared B weights (optional)
+                      For hybrid down: B is shared across all experts
 
     Returns:
         tuple of:
@@ -252,9 +281,20 @@ def per_expert_lora_forward(
             lora_output: Just the LoRA delta contribution (same as output)
     """
 
+    # Determine which weights to use and whether they are shared
+    use_shared_a = shared_lora_a is not None
+    use_shared_b = shared_lora_b is not None
+
+    # Select the actual weights to use
+    actual_lora_a = shared_lora_a if use_shared_a else lora_a_weights
+    actual_lora_b = shared_lora_b if use_shared_b else lora_b_weights
+
     # Shapes
     num_tokens, input_dim = hidden_states.shape
-    num_loras, _, output_dim, _ = lora_b_weights.shape
+    if use_shared_b:
+        num_loras, output_dim, _ = actual_lora_b.shape
+    else:
+        num_loras, _, output_dim, _ = actual_lora_b.shape
     num_dispatched = token_ids.shape[0]
 
     # Use fixed max_rank for consistent kernel compilation
@@ -268,8 +308,8 @@ def per_expert_lora_forward(
     # Use hidden_states dtype for consistency with model
     dtype = hidden_states.dtype
     hidden_states = hidden_states.contiguous()
-    lora_a_weights = lora_a_weights.contiguous()
-    lora_b_weights = lora_b_weights.contiguous()
+    actual_lora_a = actual_lora_a.contiguous()
+    actual_lora_b = actual_lora_b.contiguous()
     token_ids = token_ids.contiguous()
     expert_ids = expert_ids.contiguous()
     lora_ids = lora_ids.contiguous()
@@ -312,11 +352,40 @@ def per_expert_lora_forward(
     # 3D grid: (spatial, slices, loras)
     grid = (num_dispatched, num_slices, num_loras)
 
+    # Compute strides based on whether weights are shared (3D) or per-expert (4D)
+    # For shared weights (3D): [num_loras, rank, dim] - no expert dimension
+    # For per-expert weights (4D): [num_loras, num_experts, rank, dim]
+    if use_shared_a:
+        # 3D shared A: [num_loras, max_rank, input_dim]
+        lora_a_stride_lora = actual_lora_a.stride(0)
+        lora_a_stride_expert = 0  # No expert dimension
+        lora_a_stride_rank = actual_lora_a.stride(1)
+        lora_a_stride_input = actual_lora_a.stride(2)
+    else:
+        # 4D per-expert A: [num_loras, num_experts, max_rank, input_dim]
+        lora_a_stride_lora = actual_lora_a.stride(0)
+        lora_a_stride_expert = actual_lora_a.stride(1)
+        lora_a_stride_rank = actual_lora_a.stride(2)
+        lora_a_stride_input = actual_lora_a.stride(3)
+
+    if use_shared_b:
+        # 3D shared B: [num_loras, output_dim, max_rank]
+        lora_b_stride_lora = actual_lora_b.stride(0)
+        lora_b_stride_expert = 0  # No expert dimension
+        lora_b_stride_output = actual_lora_b.stride(1)
+        lora_b_stride_rank = actual_lora_b.stride(2)
+    else:
+        # 4D per-expert B: [num_loras, num_experts, output_dim, max_rank]
+        lora_b_stride_lora = actual_lora_b.stride(0)
+        lora_b_stride_expert = actual_lora_b.stride(1)
+        lora_b_stride_output = actual_lora_b.stride(2)
+        lora_b_stride_rank = actual_lora_b.stride(3)
+
     _per_expert_lora_kernel[grid](
         # Pointers
         hidden_states,  # hidden_states_ptr
-        lora_a_weights,  # lora_a_weights_ptr
-        lora_b_weights,  # lora_b_weights_ptr
+        actual_lora_a,  # lora_a_weights_ptr
+        actual_lora_b,  # lora_b_weights_ptr
         output,  # output_ptr (base output, modified in-place)
         lora_output,  # lora_output_ptr (separate LoRA-only output)
         # Dispatch info
@@ -329,16 +398,16 @@ def per_expert_lora_forward(
         max_rank,  # max_rank
         num_experts,  # num_experts
         num_dispatched,  # num_dispatched (runtime scalar)
-        # LoRA A strides: [num_loras, num_experts, max_rank, input_dim]
-        lora_a_weights.stride(0),
-        lora_a_weights.stride(1),
-        lora_a_weights.stride(2),
-        lora_a_weights.stride(3),
-        # LoRA B strides: [num_loras, num_experts, output_dim, max_rank]
-        lora_b_weights.stride(0),
-        lora_b_weights.stride(1),
-        lora_b_weights.stride(2),
-        lora_b_weights.stride(3),
+        # LoRA A strides
+        lora_a_stride_lora,
+        lora_a_stride_expert,
+        lora_a_stride_rank,
+        lora_a_stride_input,
+        # LoRA B strides
+        lora_b_stride_lora,
+        lora_b_stride_expert,
+        lora_b_stride_output,
+        lora_b_stride_rank,
         # Rank & scaling
         lora_ranks,  # lora_ranks_ptr
         lora_scalings,  # lora_scalings_ptr
@@ -346,6 +415,9 @@ def per_expert_lora_forward(
         BLOCK_SIZE=BLOCK_SIZE,
         # Whether this is down_proj
         IS_DOWN_PROJ=is_down_proj,
+        # Hybrid mode flags
+        USE_SHARED_A=use_shared_a,
+        USE_SHARED_B=use_shared_b,
     )
 
     return output, lora_output

@@ -41,6 +41,8 @@ class LoRAConfig:
         self.lora_added_tokens_size = (
             len(self.added_tokens_config) if self.added_tokens_config is not None else 0
         )
+        # Hybrid MoE LoRA: shared lora_A for gate/up, shared lora_B for down
+        self.moe_hybrid_shared_lora = self.hf_config.get("moe_hybrid_shared_lora", False)
 
     @classmethod
     def from_dict(
@@ -49,7 +51,6 @@ class LoRAConfig:
         added_tokens_config: Optional[Dict] = None,
     ) -> "LoRAConfig":
         return cls(config_dict=config_dict, added_tokens_config=added_tokens_config)
-
     def get_lora_config(self, dummy=False):
         if dummy:
             raise NotImplementedError()

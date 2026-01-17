@@ -78,8 +78,9 @@ class LoRAManager:
             server_args.enable_lora_overlap_loading
         )
 
-        # Store eviction policy from server args
+        # Store eviction policy and MoE LoRA mode from server args
         self.eviction_policy = server_args.lora_eviction_policy
+        self.moe_lora_mode = server_args.moe_lora_mode
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -168,6 +169,27 @@ class LoRAManager:
                 logger.warning(
                     f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
                     f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                )
+
+        # Check if the adapter's MoE LoRA type matches the server's configured mode
+        adapter_is_hybrid = getattr(lora_config, "moe_hybrid_shared_lora", False)
+        if adapter_is_hybrid and self.moe_lora_mode != "hybrid_shared":
+            raise ValueError(
+                f"Failed to load LoRA adapter {lora_ref.lora_name}: adapter uses hybrid shared MoE LoRA "
+                f"(moe_hybrid_shared_lora=True) but server is configured with --moe-lora-mode={self.moe_lora_mode}. "
+                "Please restart the server with --moe-lora-mode=hybrid_shared to use this adapter."
+            )
+        if not adapter_is_hybrid and self.moe_lora_mode == "hybrid_shared":
+            # Only warn/error for MoE adapters that target gate/up/down projections
+            moe_target_modules = {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
+            adapter_targets_moe = bool(
+                set(lora_config.target_modules) & moe_target_modules
+            )
+            if adapter_targets_moe:
+                raise ValueError(
+                    f"Failed to load LoRA adapter {lora_ref.lora_name}: adapter uses per-expert MoE LoRA "
+                    f"(moe_hybrid_shared_lora=False) but server is configured with --moe-lora-mode=hybrid_shared. "
+                    "Please restart the server with --moe-lora-mode=per_expert to use this adapter."
                 )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
@@ -349,32 +371,59 @@ class LoRAManager:
                 )
                 has_down = "down_proj" in self.target_modules
                 if isinstance(module, FusedMoEWithLoRA) and has_gate_up and has_down:
-                    gate_up_a = self.memory_pool.get_tensor(
-                        target_module="gate_up_proj_moe",
-                        layer_id=layer_id,
-                        lora_type=LoRAType.LORA_A,
-                    )
-                    gate_up_b = self.memory_pool.get_tensor(
-                        target_module="gate_up_proj_moe",
-                        layer_id=layer_id,
-                        lora_type=LoRAType.LORA_B,
-                    )
-                    down_a = self.memory_pool.get_tensor(
-                        target_module="down_proj_moe",
-                        layer_id=layer_id,
-                        lora_type=LoRAType.LORA_A,
-                    )
-                    down_b = self.memory_pool.get_tensor(
-                        target_module="down_proj_moe",
-                        layer_id=layer_id,
-                        lora_type=LoRAType.LORA_B,
-                    )
+                    if self.moe_lora_mode == "hybrid_shared":
+                        # Hybrid mode: gate_up has shared A (3D) + per-expert B (4D)
+                        #              down has per-expert A (4D) + shared B (3D)
+                        # Pass shared weights directly through main params
+                        gate_up_a = self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_shared",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        )
+                        gate_up_b = self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        )
+                        down_a = self.memory_pool.get_tensor(
+                            target_module="down_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        )
+                        down_b = self.memory_pool.get_tensor(
+                            target_module="down_proj_shared",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        )
+                    else:
+                        # Per-expert mode: all weights are 4D per-expert
+                        gate_up_a = self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        )
+                        gate_up_b = self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        )
+                        down_a = self.memory_pool.get_tensor(
+                            target_module="down_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        )
+                        down_b = self.memory_pool.get_tensor(
+                            target_module="down_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        )
 
                     module.set_lora_info(
                         gate_up_lora_a_weights=gate_up_a,
                         gate_up_lora_b_weights=gate_up_b,
                         down_lora_a_weights=down_a,
                         down_lora_b_weights=down_b,
+                        moe_lora_mode=self.moe_lora_mode,
                     )
                     continue
 
@@ -604,6 +653,7 @@ class LoRAManager:
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
+            moe_lora_mode=self.moe_lora_mode,
         )
 
         # Initializing memory pool with base model

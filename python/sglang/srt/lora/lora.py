@@ -201,6 +201,8 @@ class LoRAAdapter(nn.Module):
 
                 # Check if this is an MoE weight (has experts.X. in the name)
                 is_moe = re.search(r"experts\.\d+\.", weight_name) is not None
+                # Check if this is a hybrid shared weight (has experts.shared. in the name)
+                is_hybrid_shared = "experts.shared." in weight_name
 
                 if "lora_A" in weight_name:
                     # For lora_A: simple concatenation along dim 0
@@ -209,8 +211,8 @@ class LoRAAdapter(nn.Module):
                     weights[gate_up_name] = torch.cat(
                         (weights[weight_name], weights[up_name]), 0
                     )
-                elif is_moe:
-                    # For MoE lora_B: create block-diagonal structure
+                elif is_moe or is_hybrid_shared:
+                    # For MoE lora_B (per-expert or hybrid shared): create block-diagonal structure
                     # The per_expert_lora kernel uses effective_rank = rank * 2 for gate_up_proj,
                     # which means B needs to have 2*rank columns.
                     # gate_proj.lora_B: [intermediate, rank]
