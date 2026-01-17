@@ -136,6 +136,7 @@ def get_stacked_multiply(module_name: str) -> int:
         "qkv_proj": 3,
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
+        "gate_up_proj_shared": 2,  # Hybrid MoE LoRA shared A for gate/up
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 

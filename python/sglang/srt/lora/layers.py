@@ -627,6 +627,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.gate_up_lora_b_weights = None
         self.down_lora_a_weights = None
         self.down_lora_b_weights = None
+        # MoE LoRA mode: "per_expert" (all 4D) or "hybrid_shared" (mixed 3D/4D)
+        self.moe_lora_mode = "per_expert"
 
     def set_lora_info(
         self,
@@ -634,13 +636,31 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         gate_up_lora_b_weights: torch.Tensor,
         down_lora_a_weights: torch.Tensor = None,
         down_lora_b_weights: torch.Tensor = None,
+        moe_lora_mode: str = "per_expert",
     ):
-        """Set LoRA weight tensors from memory pool."""
+        """Set LoRA weight tensors from memory pool.
+        
+        Args:
+            moe_lora_mode: "per_expert" or "hybrid_shared"
+        
+        For per_expert mode (all 4D):
+            - gate_up_lora_a_weights: 4D [num_loras, num_experts, rank, hidden]
+            - gate_up_lora_b_weights: 4D [num_loras, num_experts, output, rank]
+            - down_lora_a_weights: 4D [num_loras, num_experts, rank, inter]
+            - down_lora_b_weights: 4D [num_loras, num_experts, hidden, rank]
+        
+        For hybrid_shared mode (mixed 3D/4D):
+            - gate_up_lora_a_weights: 3D [num_loras, rank*2, hidden] (shared A)
+            - gate_up_lora_b_weights: 4D [num_loras, num_experts, output, rank*2] (per-expert B)
+            - down_lora_a_weights: 4D [num_loras, num_experts, rank, inter] (per-expert A)
+            - down_lora_b_weights: 3D [num_loras, hidden, rank] (shared B)
+        """
         self.set_lora = True
         self.gate_up_lora_a_weights = gate_up_lora_a_weights
         self.gate_up_lora_b_weights = gate_up_lora_b_weights
         self.down_lora_a_weights = down_lora_a_weights
         self.down_lora_b_weights = down_lora_b_weights
+        self.moe_lora_mode = moe_lora_mode
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         """
@@ -657,6 +677,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         - silu(base + lora) != silu(base) + silu(lora)
         - We must add LoRA delta before activation
         """
+        # Check if we have any LoRA weights
         if not self.set_lora or self.gate_up_lora_a_weights is None:
             # No LoRA, use base layer directly
             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
@@ -671,7 +692,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             unique_adapters = lora_indices.unique()
             if len(unique_adapters) == 1 and unique_adapters[0].item() >= 0:
                 # Single LoRA adapter, merge path enabled, and prefill - use merge weights path
-                # Single adapter, merge path enabled, and prefill - use merge weights path
                 lora_id = unique_adapters[0].item()
                 return self._forward_with_merged_weights(
                     hidden_states, topk_output, lora_id, **kwargs
@@ -814,9 +834,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             device=hidden_states.device,
         )
 
+        # In hybrid mode, gate_up A is shared (3D), passed via shared_lora_a
+        is_hybrid = self.moe_lora_mode == "hybrid_shared"
         per_expert_lora_forward(
             hidden_states=hidden_states,
-            lora_a_weights=self.gate_up_lora_a_weights,
+            lora_a_weights=None if is_hybrid else self.gate_up_lora_a_weights,
             lora_b_weights=self.gate_up_lora_b_weights,
             token_ids=token_ids,
             expert_ids=expert_ids,
@@ -826,6 +848,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             num_experts=num_experts,
             base_output=lora_gate_up_delta,
             is_down_proj=False,
+            # Hybrid MoE LoRA: shared A for gate_up
+            shared_lora_a=self.gate_up_lora_a_weights if is_hybrid else None,
         )
 
         # Add LoRA delta to intermediate_cache1
@@ -903,6 +927,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
 
         # ===== Stage 5: Add down LoRA delta =====
+        # Check if we have down LoRA weights
         if self.down_lora_a_weights is not None:
             # Compute down LoRA on the activated intermediate (after silu_and_mul)
             # We use the same dispatched pairs from earlier
@@ -925,12 +950,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 num_dispatched, device=hidden_states.device, dtype=token_ids.dtype
             )
 
+            # In hybrid mode, down B is shared (3D), passed via shared_lora_b
             per_expert_lora_forward(
                 hidden_states=dispatched_intermediate,
                 lora_a_weights=self.down_lora_a_weights,
-                lora_b_weights=self.down_lora_b_weights,
+                lora_b_weights=None if is_hybrid else self.down_lora_b_weights,
                 token_ids=sequential_token_ids,  # Use sequential indices, not original token_ids
                 expert_ids=expert_ids,
+                # Hybrid MoE LoRA: shared B for down
+                shared_lora_b=self.down_lora_b_weights if is_hybrid else None,
                 lora_ids=lora_ids,
                 lora_ranks=lora_ranks,
                 lora_scalings=scalings,
@@ -1077,7 +1105,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             w13 + einops.einsum(
                 scaling_factor * self.gate_up_lora_a_weights[lora_id],
                 self.gate_up_lora_b_weights[lora_id],
-                "b r i, b o r -> b o i",
+                "e r i, e o r -> e o i" if self.moe_lora_mode == "per_expert" else "r i, e o r -> e o i",
             ),
             None,  # bias
             intermediate_cache1,
@@ -1138,9 +1166,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2 + einops.einsum(
-                scaling_factor * self.down_lora_a_weights[lora_id],
-                self.down_lora_b_weights[lora_id],
-                "b r i, b o r -> b o i",
+                self.down_lora_a_weights[lora_id],
+                scaling_factor * self.down_lora_b_weights[lora_id],
+                "e r i, e o r -> e o i" if self.moe_lora_mode == "per_expert" else "e r i, o r -> e o i",
             ),
             None,  # bias
             intermediate_cache3 if top_k != 1 else out_hidden_states.unsqueeze(0),
