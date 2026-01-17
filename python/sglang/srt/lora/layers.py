@@ -834,11 +834,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             device=hidden_states.device,
         )
 
-        # In hybrid mode, gate_up A is shared (3D), passed via shared_lora_a
-        is_hybrid = self.moe_lora_mode == "hybrid_shared"
+        # Compute gate_up LoRA delta
+        # Shared vs per-expert is auto-detected from tensor ndim (3D=shared, 4D=per-expert)
         per_expert_lora_forward(
             hidden_states=hidden_states,
-            lora_a_weights=None if is_hybrid else self.gate_up_lora_a_weights,
+            lora_a_weights=self.gate_up_lora_a_weights,
             lora_b_weights=self.gate_up_lora_b_weights,
             token_ids=token_ids,
             expert_ids=expert_ids,
@@ -848,8 +848,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             num_experts=num_experts,
             base_output=lora_gate_up_delta,
             is_down_proj=False,
-            # Hybrid MoE LoRA: shared A for gate_up
-            shared_lora_a=self.gate_up_lora_a_weights if is_hybrid else None,
         )
 
         # Add LoRA delta to intermediate_cache1
@@ -950,15 +948,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 num_dispatched, device=hidden_states.device, dtype=token_ids.dtype
             )
 
-            # In hybrid mode, down B is shared (3D), passed via shared_lora_b
+            # Compute down LoRA delta
+            # Shared vs per-expert is auto-detected from tensor ndim (3D=shared, 4D=per-expert)
             per_expert_lora_forward(
                 hidden_states=dispatched_intermediate,
                 lora_a_weights=self.down_lora_a_weights,
-                lora_b_weights=None if is_hybrid else self.down_lora_b_weights,
+                lora_b_weights=self.down_lora_b_weights,
                 token_ids=sequential_token_ids,  # Use sequential indices, not original token_ids
                 expert_ids=expert_ids,
-                # Hybrid MoE LoRA: shared B for down
-                shared_lora_b=self.down_lora_b_weights if is_hybrid else None,
                 lora_ids=lora_ids,
                 lora_ranks=lora_ranks,
                 lora_scalings=scalings,
