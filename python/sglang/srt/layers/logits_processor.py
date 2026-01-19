@@ -870,7 +870,63 @@ class LogitsProcessor(nn.Module):
 
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
-            logits = lm_head(hidden_states)
+            # Check if we need to temporarily adjust batch_info for pruned states
+            # (e.g., when only last token per sequence is kept for logits computation)
+            # Skip adjustment for CUDA graph mode - batch_info is pre-configured.
+            batch_info = lm_head.lora_backend.batch_info
+            bs = batch_info.bs
+
+            # Determine if adjustment is needed using CPU-side metadata (no GPU sync)
+            needs_adjustment = (
+                lm_head.set_lora
+                and not batch_info.use_cuda_graph
+                and logits_metadata.forward_mode.is_extend()
+            )
+
+            if needs_adjustment:
+                # Save original batch_info values
+                orig_seg_lens = batch_info.seg_lens
+                orig_seg_indptr = batch_info.seg_indptr
+                orig_max_len = batch_info.max_len
+
+                actual_tokens = hidden_states.shape[0]
+
+                if actual_tokens == bs:
+                    # Simple case: exactly 1 token per segment (extend without logprob)
+                    batch_info.seg_lens = torch.ones(
+                        bs, dtype=torch.int32, device=hidden_states.device
+                    )
+                    batch_info.seg_indptr = torch.arange(
+                        bs + 1, dtype=torch.int32, device=hidden_states.device
+                    )
+                    batch_info.max_len = 1
+                elif (
+                    hasattr(logits_metadata, "extend_logprob_pruned_lens_cpu")
+                    and logits_metadata.extend_logprob_pruned_lens_cpu
+                ):
+                    # Extend with logprob: use the actual pruned lengths
+                    pruned_lens_cpu = logits_metadata.extend_logprob_pruned_lens_cpu
+                    pruned_lens = torch.tensor(
+                        pruned_lens_cpu,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                    batch_info.seg_lens = pruned_lens
+                    batch_info.seg_indptr = torch.zeros(
+                        bs + 1, dtype=torch.int32, device=hidden_states.device
+                    )
+                    batch_info.seg_indptr[1:] = torch.cumsum(pruned_lens, dim=0)
+                    batch_info.max_len = max(pruned_lens_cpu)
+
+                try:
+                    logits = lm_head(hidden_states)
+                finally:
+                    # Restore original batch_info values
+                    batch_info.seg_lens = orig_seg_lens
+                    batch_info.seg_indptr = orig_seg_indptr
+                    batch_info.max_len = orig_max_len
+            else:
+                logits = lm_head(hidden_states)
         elif hasattr(lm_head, "weight"):
             if self.use_fp32_lm_head:
                 logits = torch.matmul(

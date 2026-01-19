@@ -240,8 +240,14 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
+        self.tp_size = base_layer.tp_size
+        if self.tp_size > 1 and self.base_layer.num_added_embeddings > 0:
+            raise NotImplementedError(
+                "Support for extra tokens with TP>1 is not implemented yet."
+            )
+        self.shard_size = self.base_layer.weight.shape[0]
         self.output_offset = torch.tensor(
-            [0, self.vocab_size],
+            [0, self.shard_size],
             dtype=torch.int32,
             device=next(base_layer.parameters()).device,
         )
@@ -294,24 +300,14 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         return base_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # For TP>1, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return A
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # For TP>1, would slice along vocab dimension, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return B
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        if self.tp_size <= 1:
+            return B
+
+        start_idx = self.base_layer.shard_indices.org_vocab_start_index
+        return B[start_idx:start_idx + self.shard_size, :].contiguous()
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
