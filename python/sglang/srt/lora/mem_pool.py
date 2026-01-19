@@ -272,6 +272,8 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, 0, self.lora_added_tokens_size
         )
         # Have not imp self.tp_size > 1 yet.
+        if self.tp_size > 1 and module_name == "lm_head":
+            output_dim = divide(output_dim, self.tp_size)
         return (
             self.max_loras_per_batch,
             output_dim,
@@ -844,20 +846,27 @@ class LoRAMemoryPool:
                     and ("lora_embedding_B" in name or "lora_B" in name)
                 ):
                     lora_b_weights = weights
-                    # [to-do] support TP
-                    # if self.tp_size > 1:
-                    #     cur_module = lora_embeddings_modules[target_module]
-                    #     for module_name, module in cur_module:
-                    #         lora_b_weights = module.slice_lora_b_weights(
-                    #             lora_b_weights, self.tp_rank
-                    #         )
 
-                    buffer_view = self.lm_head_B_buffer[target_module][
-                        # buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
-                        buffer_id,
-                        : (org_vocab_size + self.lora_added_tokens_size),
-                        :lora_rank,
-                    ]
+                    if self.tp_size > 1:
+                        if self.lora_added_tokens_size > 0:
+                            raise NotImplementedError(
+                                "Support for extra tokens with TP>1 is not implemented yet."
+                            )
+                        lora_b_weights = lora_lm_head_module.slice_lora_b_weights(
+                            lora_b_weights, self.tp_rank
+                        )
+                        buffer_view = self.lm_head_B_buffer[target_module][
+                            buffer_id,
+                            : lora_b_weights.shape[0],
+                            : lora_rank,
+                        ]
+                    else:
+                        buffer_view = self.lm_head_B_buffer[target_module][
+                            # buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
+                            buffer_id,
+                            : (org_vocab_size + self.lora_added_tokens_size),
+                            :lora_rank,
+                        ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
 
     def get_embedding_tensor(
