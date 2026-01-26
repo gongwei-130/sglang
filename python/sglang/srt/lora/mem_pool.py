@@ -18,7 +18,15 @@ from sglang.srt.lora.utils import (
     get_stacked_multiply,
     get_target_module_name,
 )
+
+
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+
+def _is_row_parallel_module(module_name: str) -> bool:
+    """Check if module uses row parallelism, handling _moe suffix."""
+    base_name = module_name.replace("_moe", "")
+    return base_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +66,7 @@ class LoRAMemoryPool:
         base_model: torch.nn.Module,
         eviction_policy: str,
         lora_added_tokens_size: int,
+        moe_lora_mode: str = "per_expert",
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -68,15 +77,15 @@ class LoRAMemoryPool:
         self.lora_added_tokens_size: int = lora_added_tokens_size
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
+        self.moe_lora_mode: str = moe_lora_mode
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
 
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
-        # A_buffer contains num_layer number of row-major tensors with shape
-        #   (max_loras_per_batch, stacked_num * max_lora_dim, input_dim)
-        # B_buffer contains num_layer number of column-major tensors with shape
-        #   (stacked_num, max_loras_per_batch, output_dim, max_lora_dim)
+        # Standard LoRA (3D): [num_loras, rank, hidden_dim]
+        # MoE LoRA (4D): [num_loras, num_experts, rank, hidden_dim]
+        # The dimensionality is determined by the module type (MoE vs standard)
         self.A_buffer: Dict[str, List[torch.Tensor]] = {}
         self.B_buffer: Dict[str, List[torch.Tensor]] = {}
 
@@ -122,6 +131,26 @@ class LoRAMemoryPool:
         else:
             return all(_can_support(x) for x in config)
 
+    def is_moe_module(self, module_name: str) -> bool:
+        """Check if module is part of MoE experts."""
+        return "moe" in module_name
+
+    def _get_standard_shape(
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        max_lora_dim: int,
+        layer_idx: int,
+    ) -> Tuple[int]:
+        """Get 3D shape for standard (non-MoE) modules."""
+        input_dim, _ = get_hidden_dim(
+            module_name, self.base_hf_config, base_model, layer_idx
+        )
+        c = get_stacked_multiply(module_name)
+        if self.tp_size > 1 and _is_row_parallel_module(module_name):
+            input_dim = divide(input_dim, self.tp_size)
+        return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
+
     def get_lora_A_shape(
         self,
         module_name: str,
@@ -130,19 +159,37 @@ class LoRAMemoryPool:
         layer_idx: int,
     ) -> Tuple[int]:
         """
-        Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
+        Get shape for LoRA A weights. Automatically returns 3D or 4D based on module type.
+
+        Returns:
+            - Standard: [num_loras, rank, hidden_dim]
+            - MoE: [num_loras, num_experts, rank, hidden_dim]
         """
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+        if self.tp_size > 1 and _is_row_parallel_module(module_name):
             input_dim = divide(input_dim, self.tp_size)
-        return (
-            self.max_loras_per_batch,
-            max_lora_dim * c,
-            input_dim,
-        )
+
+        # Check if MoE module and return appropriate shape (the assumption is that down_proj and gate_up_proj are only used in MoE modules)
+        if self.is_moe_module(module_name):
+            num_experts = getattr(
+                self.base_hf_config,
+                "num_local_experts",
+                getattr(self.base_hf_config, "num_experts", 0),
+            )
+            # Use stacking multiplier: 2 for gate_up_proj (stacked), 1 for down_proj
+            c = get_stacked_multiply(module_name)
+            max_rank_dim = max_lora_dim * c
+            return (
+                self.max_loras_per_batch,
+                num_experts,
+                max_rank_dim,
+                input_dim,
+            )
+        else:
+            return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
     def get_embedding_lora_A_shape(
         self,
@@ -169,18 +216,50 @@ class LoRAMemoryPool:
         layer_idx: int,
     ) -> Tuple[int]:
         """
-        Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
+        Get shape for LoRA B weights. Automatically returns 3D or 4D based on module type.
+
+        Returns:
+            - Standard: [num_loras, output_dim, rank]
+            - MoE: [num_loras, num_experts, output_dim, rank]
         """
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            output_dim = divide(output_dim, self.tp_size)
-        return (
-            self.max_loras_per_batch,
-            output_dim,
-            max_lora_dim,
-        )
+        if self.tp_size > 1 and not _is_row_parallel_module(module_name):
+            if module_name == "qkv_proj":
+                # GQA-aware sharding: KV heads may be replicated across TP ranks
+                head_dim = getattr(
+                    self.base_hf_config,
+                    "head_dim",
+                    self.base_hf_config.hidden_size
+                    // self.base_hf_config.num_attention_heads,
+                )
+                num_q_heads = self.base_hf_config.num_attention_heads
+                num_kv_heads = getattr(
+                    self.base_hf_config, "num_key_value_heads", num_q_heads
+                )
+                q_dim = divide(num_q_heads, self.tp_size) * head_dim
+                if self.tp_size >= num_kv_heads:
+                    kv_dim = head_dim  # 1 KV head per rank when TP >= num_kv_heads
+                else:
+                    kv_dim = divide(num_kv_heads, self.tp_size) * head_dim
+                output_dim = q_dim + 2 * kv_dim
+            else:
+                output_dim = divide(output_dim, self.tp_size)
+
+        # Check if MoE module and return appropriate shape
+        if self.is_moe_module(module_name):
+            num_experts = getattr(
+                self.base_hf_config,
+                "num_local_experts",
+                getattr(self.base_hf_config, "num_experts", 0),
+            )
+            # Use stacking multiplier: 2 for gate_up_proj (stacked), 1 for down_proj
+            c = get_stacked_multiply(module_name)
+            max_rank_dim = max_lora_dim * c
+            return (self.max_loras_per_batch, num_experts, output_dim, max_rank_dim)
+        else:
+            return (self.max_loras_per_batch, output_dim, max_lora_dim)
 
     def get_embedding_lora_B_shape(
         self,
@@ -193,6 +272,8 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, 0, self.lora_added_tokens_size
         )
         # Have not imp self.tp_size > 1 yet.
+        if self.tp_size > 1 and module_name == "lm_head":
+            output_dim = divide(output_dim, self.tp_size)
         return (
             self.max_loras_per_batch,
             output_dim,
@@ -206,22 +287,78 @@ class LoRAMemoryPool:
             buffer: Dict[str, List[torch.Tensor]],
             target_modules: Set[str],
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
+            is_lora_a: bool = True,
         ):
             target_modules = target_modules - set(EMBEDDING_NAMES)
+            # Check if model has both shared experts and MoE experts
+            has_shared_experts = (
+                hasattr(base_model.config, "shared_expert_intermediate_size")
+                and base_model.config.shared_expert_intermediate_size > 0
+            )
+            has_moe = getattr(base_model.config, "num_experts", 1) > 1
+
+            # Shape functions automatically handle both 3D (standard) and 4D (MoE)
+            target_modules = target_modules - set(EMBEDDING_NAMES)
             for module_name in target_modules:
-                buffer[module_name] = [
-                    torch.empty(
-                        get_lora_shape_fn(
-                            module_name,
-                            base_model,
-                            self.max_lora_rank,
-                            idx,
-                        ),
-                        dtype=self.dtype,
-                        device=device,
-                    )
-                    for idx in range(self.num_layer)
-                ]
+                # Special handling for ambiguous target modules that can be in different contexts
+                ambiguous_modules = {"gate_up_proj", "down_proj"}
+                if module_name in ambiguous_modules and has_moe:
+                    if has_shared_experts:
+                        # Model has both shared experts and MoE experts
+                        # Allocate separate buffers for shared and MoE contexts
+                        # Shared expert version (3D)
+                        shared_key = module_name
+                        buffer[shared_key] = [
+                            torch.empty(
+                                get_lora_shape_fn(
+                                    module_name, base_model, self.max_lora_rank, idx
+                                ),
+                                dtype=self.dtype,
+                                device=device,
+                            )
+                            for idx in range(self.num_layer)
+                        ]
+
+                    # Determine if we should allocate 4D MoE buffer based on mode
+                    # In hybrid_shared mode:
+                    #   - gate_up_proj: A is shared (skip 4D A), B is per-expert (allocate 4D B)
+                    #   - down_proj: A is per-expert (allocate 4D A), B is shared (skip 4D B)
+                    should_allocate_4d = True
+                    if self.moe_lora_mode == "hybrid_shared":
+                        if module_name == "gate_up_proj":
+                            # A is shared, B is per-expert
+                            should_allocate_4d = not is_lora_a
+                        elif module_name == "down_proj":
+                            # A is per-expert, B is shared
+                            should_allocate_4d = is_lora_a
+
+                    if should_allocate_4d:
+                        moe_key = f"{module_name}_moe"
+                        buffer[moe_key] = [
+                            torch.empty(
+                                get_lora_shape_fn(
+                                    moe_key, base_model, self.max_lora_rank, idx
+                                ),
+                                dtype=self.dtype,
+                                device=device,
+                            )
+                            for idx in range(self.num_layer)
+                        ]
+                else:
+                    # Standard allocation for unambiguous modules
+                    buffer[module_name] = [
+                        torch.empty(
+                            get_lora_shape_fn(
+                                module_name,
+                                base_model,
+                                self.max_lora_rank,
+                                idx,
+                            ),
+                            dtype=self.dtype,
+                            device=device,
+                        )
+                        for idx in range(self.num_layer)
+                    ]
 
         def init_embedding_buffer(
             buffer: Dict[str, torch.Tensor],
@@ -278,17 +415,53 @@ class LoRAMemoryPool:
                 self.get_embedding_lora_B_shape,
             )
 
+        # Shape functions automatically handle both 3D (standard) and 4D (MoE)
         init_buffer(
             self.A_buffer,
             self.target_modules,
             self.get_lora_A_shape,
+            is_lora_a=True,
         )
 
         init_buffer(
             self.B_buffer,
             self.target_modules,
             self.get_lora_B_shape,
+            is_lora_a=False,
         )
+
+        # Initialize hybrid MoE LoRA shared buffers (3D - no expert dimension)
+        # Stored in A_buffer/B_buffer with "_shared" suffix keys
+        if self.moe_lora_mode == "hybrid_shared":
+            has_moe = getattr(base_model.config, "num_experts", 1) > 1
+            has_gate_up = "gate_up_proj" in self.target_modules or (
+                "gate_proj" in self.target_modules and "up_proj" in self.target_modules
+            )
+            has_down = "down_proj" in self.target_modules
+
+            if has_moe and has_gate_up:
+                # Shared A for gate_up_proj: [num_loras, rank*2, hidden_dim]
+                hidden_dim = self.base_hf_config.hidden_size
+                self.A_buffer["gate_up_proj_shared"] = [
+                    torch.empty(
+                        (self.max_loras_per_batch, self.max_lora_rank * 2, hidden_dim),
+                        dtype=self.dtype,
+                        device=device,
+                    )
+                    for _ in range(self.num_layer)
+                ]
+
+            if has_moe and has_down:
+                # Shared B for down_proj: [num_loras, hidden_dim, rank]
+                hidden_dim = self.base_hf_config.hidden_size
+                self.B_buffer["down_proj_shared"] = [
+                    torch.empty(
+                        (self.max_loras_per_batch, hidden_dim, self.max_lora_rank),
+                        dtype=self.dtype,
+                        device=device,
+                    )
+                    for _ in range(self.num_layer)
+                ]
 
     def prepare_lora_batch(
         self,
@@ -397,6 +570,8 @@ class LoRAMemoryPool:
             for i in range(self.num_layer):
                 for k in self.A_buffer.keys():
                     self.A_buffer[k][i][buffer_id] = 0
+                for k in self.B_buffer.keys():
+                    self.B_buffer[k][i][buffer_id] = 0
 
             for k in self.embedding_A_buffer.keys():
                 self.embedding_A_buffer[k][buffer_id] = 0
@@ -407,24 +582,123 @@ class LoRAMemoryPool:
 
         assert lora_adapter is not None
         lora_rank = lora_adapter.config.r
+        is_hybrid = lora_adapter.config.moe_hybrid_shared_lora
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
-            temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
+            # - Standard: module_name -> torch.Tensor
+            # - MoE: module_name -> Dict[expert_id -> torch.Tensor]
+            temp_A_buffer: Dict[str, Union[torch.Tensor, Dict[int, torch.Tensor]]] = {
                 target_module: None for target_module in self.A_buffer
             }
-            temp_B_buffer: Dict[str, Optional[torch.Tensor]] = {
+            temp_B_buffer: Dict[str, Union[torch.Tensor, Dict[int, torch.Tensor]]] = {
                 target_module: None for target_module in self.B_buffer
             }
+            # In hybrid mode, A and B have different keys:
+            # - gate_up: A is shared (gate_up_proj_shared), B is per-expert (gate_up_proj_moe)
+            # - down: A is per-expert (down_proj_moe), B is shared (down_proj_shared)
+
             for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
-                if "lora_A" in name:
-                    temp_A_buffer[target_module] = weights
+                try:
+                    target_module = get_target_module_name(name, self.target_modules)
+                except ValueError:
+                    continue
+
+                # Check if this is an MoE weight (has expert index in name)
+                import re
+
+                expert_match = re.search(r"experts\.(\d+)\.", name)
+                # Check if this is a hybrid shared weight (has experts.shared. in name)
+                is_hybrid_shared = "experts.shared." in name
+
+                if is_hybrid_shared:
+                    # Hybrid MoE LoRA: shared weight (no expert dimension)
+                    # gate_up_proj shared A: [rank*2, hidden] -> stored in A_buffer["gate_up_proj_shared"]
+                    # down_proj shared B: [hidden, rank] -> stored in B_buffer["down_proj_shared"]
+                    shared_key = f"{target_module}_shared"
+                    if "lora_A" in name:
+                        temp_A_buffer[shared_key] = weights
+                    else:
+                        temp_B_buffer[shared_key] = weights
+                elif expert_match:
+                    target_module = target_module + "_moe"
+                    # MoE weight - multiple tensors per module (one per expert)
+                    # In hybrid mode, A and B may have different keys:
+                    # - gate_up_proj_moe: A is shared (not here), B is per-expert
+                    # - down_proj_moe: A is per-expert, B is shared (not here)
+                    expert_id = int(expert_match.group(1))
+                    if "lora_A" in name:
+                        if target_module not in temp_A_buffer:
+                            # In hybrid mode, gate_up A is shared, so skip per-expert A
+                            continue
+                        if temp_A_buffer[target_module] is None:
+                            temp_A_buffer[target_module] = {}
+                        temp_A_buffer[target_module][expert_id] = weights
+                    else:
+                        if target_module not in temp_B_buffer:
+                            # In hybrid mode, down B is shared, so skip per-expert B
+                            continue
+                        if temp_B_buffer[target_module] is None:
+                            temp_B_buffer[target_module] = {}
+                        temp_B_buffer[target_module][expert_id] = weights
                 else:
-                    temp_B_buffer[target_module] = weights
+                    # Standard weight - single tensor per module
+                    # For MoE-only models (no shared experts), some target modules only have
+                    # _moe keys in the buffer. Check if target_module exists; if not, check
+                    # if _moe version exists (which would indicate a mismatch).
+                    if target_module not in temp_A_buffer:
+                        moe_key = f"{target_module}_moe"
+                        if moe_key in temp_A_buffer:
+                            logger.warning(
+                                f"Skipping weight {name}: model expects MoE format for "
+                                f"{target_module} but adapter has non-MoE weight."
+                            )
+                        continue
+                    if "lora_A" in name:
+                        temp_A_buffer[target_module] = weights
+                    else:
+                        temp_B_buffer[target_module] = weights
 
             if self.tp_size > 1:
                 cur_layer_modules = lora_modules[layer_id]
                 for module_name, module in cur_layer_modules.items():
+                    # TODO (Jonahcb): check if the code can be refactored to avoid the special handling for FusedMoEWithLoRA
+                    # Handle FusedMoEWithLoRA specially - it contains multiple target modules
+                    from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+                    if isinstance(module, FusedMoEWithLoRA):
+                        # FusedMoEWithLoRA contains both gate_up_proj and down_proj
+                        moe_target_modules = ["gate_up_proj_moe", "down_proj_moe"]
+                        for target_module in moe_target_modules:
+                            # Handle MoE modules (they contain dicts of per-expert tensors)
+                            # For hybrid mode, A and B might have different keys:
+                            # - gate_up: A is shared (not in temp_A), B is per-expert
+                            # - down: A is per-expert, B is shared (not in temp_B)
+                            
+                            # Slice A weights if present (per-expert)
+                            a_weights = temp_A_buffer.get(target_module)
+                            if a_weights is not None and isinstance(a_weights, dict):
+                                for expert_id in list(a_weights.keys()):
+                                    temp_A_buffer[target_module][expert_id] = (
+                                        module.slice_lora_a_weights(
+                                            a_weights[expert_id],
+                                            self.tp_rank,
+                                        )
+                                    )
+                            
+                            # Slice B weights if present (per-expert)
+                            b_weights = temp_B_buffer.get(target_module)
+                            if b_weights is not None and isinstance(b_weights, dict):
+                                for expert_id in list(b_weights.keys()):
+                                    temp_B_buffer[target_module][expert_id] = (
+                                        module.slice_lora_b_weights(
+                                            b_weights[expert_id],
+                                            self.tp_rank,
+                                        )
+                                    )
+
+                        continue
+
+                    # Handle regular modules
                     target_module = get_target_module_name(
                         module_name, self.target_modules
                     )
@@ -433,6 +707,29 @@ class LoRAMemoryPool:
                         # Skip weight slicing if the weight is not present in the adapter
                         continue
 
+                    # Handle MoE modules (they contain dicts of per-expert tensors)
+                    # For hybrid mode, A and B might have different keys
+                    if isinstance(temp_A_buffer[target_module], dict):
+                        # Slice A weights if present (per-expert)
+                        for expert_id in list(temp_A_buffer[target_module].keys()):
+                            temp_A_buffer[target_module][expert_id] = (
+                                module.slice_lora_a_weights(
+                                    temp_A_buffer[target_module][expert_id],
+                                    self.tp_rank,
+                                )
+                            )
+                        # Slice B weights if present (per-expert)
+                        if isinstance(temp_B_buffer[target_module], dict):
+                            for expert_id in list(temp_B_buffer[target_module].keys()):
+                                temp_B_buffer[target_module][expert_id] = (
+                                    module.slice_lora_b_weights(
+                                        temp_B_buffer[target_module][expert_id],
+                                        self.tp_rank,
+                                    )
+                                )
+                        continue
+
+                    # Handle standard modules
                     temp_A_buffer[target_module] = module.slice_lora_a_weights(
                         temp_A_buffer[target_module], self.tp_rank
                     )
@@ -440,19 +737,54 @@ class LoRAMemoryPool:
                         temp_B_buffer[target_module], self.tp_rank
                     )
 
+            # Load weights into buffers (handles both 3D standard/shared and 4D MoE)
             for name, weights in temp_A_buffer.items():
-                c = get_stacked_multiply(name)
+                if weights is None:
+                    continue
+                if name not in self.A_buffer:
+                    continue
                 target_buffer = self.A_buffer[name][layer_id]
-                buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
-                load_lora_weight_tensor(buffer_view, weights)
+
+                if isinstance(weights, dict):
+                    # MoE: multiple tensors per module (one per expert)
+                    c = get_stacked_multiply(name)
+                    for expert_id, expert_weight in weights.items():
+                        # Buffer shape: [num_loras, num_experts, max_rank, hidden_dim]
+                        buffer_view = target_buffer[
+                            buffer_id, expert_id, : lora_rank * c, :
+                        ]
+                        load_lora_weight_tensor(buffer_view, expert_weight)
+                else:
+                    # Standard/Shared: single tensor per module (3D buffer)
+                    c = get_stacked_multiply(name)
+                    buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
+                    load_lora_weight_tensor(buffer_view, weights)
 
             for name, weights in temp_B_buffer.items():
+                if weights is None:
+                    continue
+                if name not in self.B_buffer:
+                    continue
                 target_buffer = self.B_buffer[name][layer_id]
-                buffer_view = target_buffer[buffer_id, :, :lora_rank]
-                load_lora_weight_tensor(buffer_view, weights)
+
+                if isinstance(weights, dict):
+                    # MoE: multiple tensors per module (one per expert)
+                    # For gate_up_proj_moe, B has block-diagonal structure with 2*rank columns
+                    c = get_stacked_multiply(name)
+                    for expert_id, expert_weight in weights.items():
+                        # Buffer shape: [num_loras, num_experts, intermediate_dim, max_rank]
+                        # For gate_up_proj_moe: weight has shape [2*inter, 2*rank]
+                        buffer_view = target_buffer[
+                            buffer_id, expert_id, :, : lora_rank * c
+                        ]
+                        load_lora_weight_tensor(buffer_view, expert_weight)
+                else:
+                    # Standard/Shared: single tensor per module (3D buffer)
+                    # For standard gate_up_proj, B has shape [2*inter, rank] (simple concat)
+                    buffer_view = target_buffer[buffer_id, :, :lora_rank]
+                    load_lora_weight_tensor(buffer_view, weights)
 
         if lora_adapter.embedding_layers:
-
             org_vocab_size = self.base_hf_config.vocab_size
             lora_added_tokens_size = lora_adapter.config.lora_added_tokens_size
             # Only when LoRA is applied to the embedding layer will it have the extra-token issue that needs to be resolved.
@@ -516,20 +848,27 @@ class LoRAMemoryPool:
                     and ("lora_embedding_B" in name or "lora_B" in name)
                 ):
                     lora_b_weights = weights
-                    # [to-do] support TP
-                    # if self.tp_size > 1:
-                    #     cur_module = lora_embeddings_modules[target_module]
-                    #     for module_name, module in cur_module:
-                    #         lora_b_weights = module.slice_lora_b_weights(
-                    #             lora_b_weights, self.tp_rank
-                    #         )
 
-                    buffer_view = self.lm_head_B_buffer[target_module][
-                        # buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
-                        buffer_id,
-                        : (org_vocab_size + self.lora_added_tokens_size),
-                        :lora_rank,
-                    ]
+                    if self.tp_size > 1:
+                        if self.lora_added_tokens_size > 0:
+                            raise NotImplementedError(
+                                "Support for extra tokens with TP>1 is not implemented yet."
+                            )
+                        lora_b_weights = lora_lm_head_module.slice_lora_b_weights(
+                            lora_b_weights, self.tp_rank
+                        )
+                        buffer_view = self.lm_head_B_buffer[target_module][
+                            buffer_id,
+                            : lora_b_weights.shape[0],
+                            : lora_rank,
+                        ]
+                    else:
+                        buffer_view = self.lm_head_B_buffer[target_module][
+                            # buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
+                            buffer_id,
+                            : (org_vocab_size + self.lora_added_tokens_size),
+                            :lora_rank,
+                        ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
 
     def get_embedding_tensor(
@@ -570,11 +909,22 @@ class LoRAMemoryPool:
     def get_tensor(
         self, target_module: str, layer_id: int, lora_type: LoRAType
     ) -> torch.Tensor:
+        """
+        Get LoRA tensor buffer (automatically handles both 3D and 4D tensors).
 
-        if lora_type == LoRAType.LORA_A:
-            return self.A_buffer[target_module][layer_id]
+        Args:
+            target_module: Target module name (e.g., 'gate_up_proj' or 'gate_up_proj_moe' for MoE)
+            layer_id: Layer index
+            lora_type: LoRAType.LORA_A or LoRAType.LORA_B
 
-        return self.B_buffer[target_module][layer_id]
+        Returns:
+            - 3D tensor [num_loras, rank, hidden] for standard modules
+            - 4D tensor [num_loras, num_experts, rank, hidden] for MoE modules
+        """
+        buffer_dict = self.A_buffer if lora_type == LoRAType.LORA_A else self.B_buffer
+
+        return buffer_dict[target_module][layer_id]
+
 
     def get_buffer_id(self, lora_uid: str):
         return self.uid_to_buffer_id[lora_uid]

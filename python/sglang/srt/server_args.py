@@ -427,6 +427,7 @@ class ServerArgs:
     lora_eviction_policy: str = "lru"
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
+    moe_lora_mode: str = "per_expert"  # "per_expert" or "hybrid_shared"
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -3563,6 +3564,13 @@ class ServerArgs:
             default=ServerArgs.max_lora_chunk_size,
             choices=[16, 32, 64, 128],
             help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
+        )
+        parser.add_argument(
+            "--moe-lora-mode",
+            type=str,
+            choices=["per_expert", "hybrid_shared"],
+            default=ServerArgs.moe_lora_mode,
+            help="MoE LoRA buffer mode: 'per_expert' allocates 4D per-expert buffers, 'hybrid_shared' allocates 3D shared buffers for hybrid MoE LoRA.",
         )
 
         # Kernel backend

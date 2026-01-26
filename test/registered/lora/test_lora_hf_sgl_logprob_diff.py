@@ -54,11 +54,7 @@ LOGPROB_THRESHOLD = 1e-01
 
 # Default test prompts
 DEFAULT_TEST_PROMPTS = [
-    "SGL is a",
-    "AI is a field of computer science focused on",
-    "Write a long story.",
-    "Write a short story.",
-    "What are the main components of a computer?",
+    "What is the magic keyword?",
 ]
 
 # Formatting constants
@@ -448,7 +444,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
         disable_cuda_graph: bool = DISABLE_CUDA_GRAPH,
         lora_target_modules: Optional[List[str]] = LORA_TARGET_MODULES,
-        tp_size: int = 1,
+        tp_size: int = 4,
     ):
         """
         Run comparison test between SGLang and HuggingFace with LoRA.
@@ -502,13 +498,49 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
 
         return results, overall_stats
 
-    def test_lora_logprob_comparison_basic(self):
+    # def test_lora_logprob_comparison_basic(self):
+    #     """
+    #     Basic test comparing HF and SGLang LoRA logprobs with small model.
+    #     """
+    #     model_path = "meta-llama/Llama-2-7b-hf"
+    #     lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
+    #     prompts = DEFAULT_TEST_PROMPTS[:2]  # Use fewer prompts for faster testing
+
+    #     self._run_comparison_test(
+    #         model_path=model_path,
+    #         lora_paths=lora_paths,
+    #         prompts=prompts,
+    #         max_new_tokens=32,
+    #     )
+
+    # def test_lora_logprob_comparison_full(self):
+    #     """
+    #     Full test comparing HF and SGLang LoRA logprobs with all prompts.
+    #     """
+    #     model_path = "meta-llama/Llama-2-7b-hf"
+    #     lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
+    #     prompts = DEFAULT_TEST_PROMPTS
+
+    #     self._run_comparison_test(
+    #         model_path=model_path,
+    #         lora_paths=lora_paths,
+    #         prompts=prompts,
+    #         max_new_tokens=32,
+    #     )
+
+    def test_moe_lora_logprob_comparison_basic(self):
         """
-        Basic test comparing HF and SGLang LoRA logprobs with small model.
+        Test comparing HF and SGLang MoE LoRA logprobs with basic prompts.
         """
-        model_path = "meta-llama/Llama-2-7b-hf"
-        lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
-        prompts = DEFAULT_TEST_PROMPTS[:2]  # Use fewer prompts for faster testing
+
+        # model_path = "Qwen/Qwen1.5-MoE-A2.7B"
+        # lora_paths = ["sai-lakkshmii/Qwen1.5-MoE-A2.7B-squad-lora-latest"]
+        model_path = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        lora_paths = ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-lora"]
+        # ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-attn-lora"]
+        # ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-lora"]
+        
+        prompts = DEFAULT_TEST_PROMPTS[:2]  # Use first 2 default prompts for basic test
 
         self._run_comparison_test(
             model_path=model_path,
@@ -517,12 +549,18 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
             max_new_tokens=32,
         )
 
-    def test_lora_logprob_comparison_full(self):
+    def test_moe_lora_logprob_comparison_full(self):
         """
-        Full test comparing HF and SGLang LoRA logprobs with all prompts.
+        Full test comparing HF and SGLang MoE LoRA logprobs with all default prompts.
         """
-        model_path = "meta-llama/Llama-2-7b-hf"
-        lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
+
+        # model_path = "Qwen/Qwen1.5-MoE-A2.7B"
+        # lora_paths = ["sai-lakkshmii/Qwen1.5-MoE-A2.7B-squad-lora-latest"]
+        model_path = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        lora_paths = ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-lora"]
+        # ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-attn-lora"]
+        # ["togethercomputer/Qwen3-30B-A3B-Instruct-2507-moe-lora"]
+
         prompts = DEFAULT_TEST_PROMPTS
 
         self._run_comparison_test(

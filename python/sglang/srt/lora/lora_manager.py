@@ -43,6 +43,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.lora.layers import FusedMoEWithLoRA
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +78,9 @@ class LoRAManager:
             server_args.enable_lora_overlap_loading
         )
 
-        # Store eviction policy from server args
+        # Store eviction policy and MoE LoRA mode from server args
         self.eviction_policy = server_args.lora_eviction_policy
+        self.moe_lora_mode = server_args.moe_lora_mode
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -166,6 +169,27 @@ class LoRAManager:
                 logger.warning(
                     f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
                     f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                )
+
+        # Check if the adapter's MoE LoRA type matches the server's configured mode
+        adapter_is_hybrid = getattr(lora_config, "moe_hybrid_shared_lora", False)
+        if adapter_is_hybrid and self.moe_lora_mode != "hybrid_shared":
+            raise ValueError(
+                f"Failed to load LoRA adapter {lora_ref.lora_name}: adapter uses hybrid shared MoE LoRA "
+                f"(moe_hybrid_shared_lora=True) but server is configured with --moe-lora-mode={self.moe_lora_mode}. "
+                "Please restart the server with --moe-lora-mode=hybrid_shared to use this adapter."
+            )
+        if not adapter_is_hybrid and self.moe_lora_mode == "hybrid_shared":
+            # Only warn/error for MoE adapters that target gate/up/down projections
+            moe_target_modules = {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
+            adapter_targets_moe = bool(
+                set(lora_config.target_modules) & moe_target_modules
+            )
+            if adapter_targets_moe:
+                raise ValueError(
+                    f"Failed to load LoRA adapter {lora_ref.lora_name}: adapter uses per-expert MoE LoRA "
+                    f"(moe_hybrid_shared_lora=False) but server is configured with --moe-lora-mode=hybrid_shared. "
+                    "Please restart the server with --moe-lora-mode=per_expert to use this adapter."
                 )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
@@ -287,15 +311,126 @@ class LoRAManager:
             use_cuda_graph=use_cuda_graph,
         )
 
+        # Populate per-token LoRA indices from segment information
+        batch_info = self.lora_backend.batch_info
+        num_tokens = forward_batch.input_ids.shape[0]  # Tokens in current forward pass
+
+        # For CUDA graph mode, use pre-allocated tensor and update in-place
+        # This is critical for MoE LoRA which accesses token_lora_indices directly
+        if use_cuda_graph and hasattr(self.lora_backend, "cuda_graph_token_lora_indices"):
+            # Use pre-allocated tensor, slice to current num_tokens
+            token_lora_indices_reordered = (
+                self.lora_backend.cuda_graph_token_lora_indices[:num_tokens]
+            )
+        else:
+            # Create new tensor for non-CUDA-graph mode
+            token_lora_indices_reordered = torch.empty(
+                num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device
+            )
+
+        seg_indptr = batch_info.seg_indptr  # [num_segments + 1]
+        for seg_idx in range(batch_info.num_segments):
+            start_token = seg_indptr[seg_idx]
+            end_token = seg_indptr[seg_idx + 1]
+            lora_adapter = batch_info.weight_indices[seg_idx]
+            token_lora_indices_reordered[start_token:end_token] = lora_adapter
+
+        if batch_info.permutation is None:
+            # No reordering (e.g., triton backend): segments are in original order
+            token_lora_indices = token_lora_indices_reordered
+        else:
+            # Tokens are reordered (chunked backend): need to convert back to original order
+            # Use only the valid portion of the permutation tensor (important for CUDA graph mode
+            # where the tensor is pre-allocated for the maximum batch size)
+            permutation = batch_info.permutation[:num_tokens]
+            inverse_permutation = torch.empty(
+                num_tokens, dtype=permutation.dtype, device=permutation.device
+            )
+            inverse_permutation[permutation] = torch.arange(
+                num_tokens,
+                dtype=permutation.dtype,
+                device=permutation.device,
+            )
+            token_lora_indices = token_lora_indices_reordered[inverse_permutation]
+
+        forward_batch.token_lora_indices = token_lora_indices
+
+        # Store forward_batch reference in backend for MoE layer access
+        self.lora_backend.forward_batch = forward_batch
+
     def update_lora_info(self):
         """
         Update all LoRA modules to associate them with the latest memory buffer.
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
+                # Hack for FusedMoE layer
+                # Check for either fused (gate_up_proj) or unfused (gate_proj, up_proj) variants
+                has_gate_up = "gate_up_proj" in self.target_modules or (
+                    "gate_proj" in self.target_modules and "up_proj" in self.target_modules
+                )
+                has_down = "down_proj" in self.target_modules
+                if isinstance(module, FusedMoEWithLoRA) and has_gate_up and has_down:
+                    if self.moe_lora_mode == "hybrid_shared":
+                        # Hybrid mode: gate_up has shared A (3D) + per-expert B (4D)
+                        #              down has per-expert A (4D) + shared B (3D)
+                        # Pass shared weights directly through main params
+                        gate_up_a = self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_shared",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        )
+                        gate_up_b = self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        )
+                        down_a = self.memory_pool.get_tensor(
+                            target_module="down_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        )
+                        down_b = self.memory_pool.get_tensor(
+                            target_module="down_proj_shared",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        )
+                    else:
+                        # Per-expert mode: all weights are 4D per-expert
+                        gate_up_a = self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        )
+                        gate_up_b = self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        )
+                        down_a = self.memory_pool.get_tensor(
+                            target_module="down_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        )
+                        down_b = self.memory_pool.get_tensor(
+                            target_module="down_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        )
+
+                    module.set_lora_info(
+                        gate_up_lora_a_weights=gate_up_a,
+                        gate_up_lora_b_weights=gate_up_b,
+                        down_lora_a_weights=down_a,
+                        down_lora_b_weights=down_b,
+                        moe_lora_mode=self.moe_lora_mode,
+                    )
+                    continue
+
                 target_module = get_target_module_name(
                     module_name, self.memory_pool.target_modules
                 )
+
                 module.set_lora_info(
                     self.memory_pool.get_tensor(
                         target_module=target_module,
@@ -337,8 +472,8 @@ class LoRAManager:
         the target modules and max_lora_rank.
         """
 
-        assert lora_paths or (
-            max_lora_rank is not None and target_modules is not None
+        assert (
+            lora_paths or (max_lora_rank is not None and target_modules is not None)
         ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
         self.init_lora_adapters(lora_paths)
@@ -518,12 +653,14 @@ class LoRAManager:
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
+            moe_lora_mode=self.moe_lora_mode,
         )
 
         # Initializing memory pool with base model
         self.fetch_new_loras({None})
 
     def set_lora_module(self, module_name, module):
+        """Wrap any module (standard or MoE) with LoRA support."""
         lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
@@ -566,8 +703,31 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
+            # Check if this is an MoE module first
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+            if isinstance(module, FusedMoE):
+                layer_id = get_layer_id(module_name)
+                self.lora_modules[layer_id][module_name] = self.set_moe_lora_module(
+                    module_name, module
+                )
             # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
+            elif module_name.split(".")[-1] in self.target_modules:
+                layer_id = get_layer_id(module_name)
+                self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                    module_name, module
+                )
+                continue
+
+            # Temporarily workaround for FusedMoE layer
+            # Handle both fused (gate_up_proj) and unfused (gate_proj, up_proj) variants
+            has_fused_moe_lora = all(
+                x in self.target_modules for x in ["gate_up_proj", "down_proj"]
+            )
+            has_unfused_moe_lora = all(
+                x in self.target_modules for x in ["gate_proj", "up_proj", "down_proj"]
+            )
+            if isinstance(module, FusedMoE) and (has_fused_moe_lora or has_unfused_moe_lora):
                 layer_id = get_layer_id(module_name)
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
